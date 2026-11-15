@@ -25,6 +25,8 @@ pub struct AppState {
     pub data_key_seed: Vec<u8>,
     /// The wallet's OAuth client id (the authorize rounds).
     pub wallet_client_id: String,
+    /// The Valkey URL (the presentation-session store).
+    pub valkey_url: String,
 }
 
 impl AppState {
@@ -54,10 +56,126 @@ impl AppState {
             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("device key: {e}")))?;
         Ok(p256::ecdsa::SigningKey::from(&secret))
     }
+
+    /// The user's credential holdings (the DCQL evaluation's input):
+    /// the vault rows opened into the SDK's wallet-credential view.
+    /// The claimed values feed the 6.4.1 value-matching; the mdoc
+    /// elements ride the 7.2 claims path (namespace/element).
+    pub async fn user_holdings(
+        &self,
+        user_id: &Uuid,
+    ) -> Result<Vec<wallet8::oid4vp::WalletCredential>, (axum::http::StatusCode, String)> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let _ = sqlx::query("SELECT sentin8_set_tenant_context($1)")
+            .bind(self.env_id)
+            .execute(&mut *tx)
+            .await;
+        let rows = sqlx::query!(
+            r#"SELECT id, format, doctype, vct, credential_ct
+                 FROM holder.credentials
+                WHERE user_id = $1 AND status = 'active'"#,
+            user_id,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let _ = tx.commit().await;
+        let mut out = Vec::new();
+        for row in rows {
+            let material = sentin8::crypto::open_str(&self.data_key, &row.credential_ct)
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            // The mdoc claims ride the IssuerSigned's namespaces (the
+            // disclosed values); the sd-jwt claims ride the payload.
+            let (claim_values, credential_str) = if row.format == "mso_mdoc" {
+                mdoc_claims(&material)
+            } else {
+                sd_jwt_claims(&material)
+            };
+            out.push(wallet8::oid4vp::WalletCredential {
+                format: row.format,
+                doctype: row.doctype,
+                vct: row.vct,
+                credential: credential_str,
+                claim_values,
+            });
+        }
+        Ok(out)
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The JAR payload of a request object (RFC 9101: the JWT's claims
+/// part; the SIGNATURE verification rides the trust-anchor surface -
+/// this extracts the claims the shape gate + the DCQL evaluation
+/// read).
+///
+/// # Errors
+/// A malformed JWT (missing segments / non-JSON claims).
+pub fn jar_claims(jwt: &str) -> Result<String, String> {
+    let part = jwt
+        .split('.')
+        .nth(1)
+        .ok_or("the request object carries no payload segment")?;
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(part)
+        .map_err(|e| format!("the request object payload decode: {e}"))?;
+    String::from_utf8(raw).map_err(|e| format!("the request object payload utf8: {e}"))
+}
+
+/// The mdoc IssuerSigned's disclosed claims (the 7.2 claims path
+/// keys: `namespace/element`) + the base64url credential form (the
+/// vault stores the SEALED material; the material IS the base64url
+/// IssuerSigned the issuance returned).
+///
+/// # Errors
+/// Never (the parse degrades to empty claims - the DCQL value
+/// matching treats unreadable values as absent, 6.4.1).
+pub fn mdoc_claims(material: &[u8]) -> (std::collections::BTreeMap<String, serde_json::Value>, String) {
+    let mut map = std::collections::BTreeMap::new();
+    if let Ok(text) = std::str::from_utf8(material) {
+        if let Some(ns) = sentin8::mdoc::parse_issuer_signed_claims(text).ok().flatten() {
+            map = ns;
+        }
+    }
+    (map, String::from_utf8_lossy(material).to_string())
+}
+
+/// The SD-JWT's payload claims (the 7.1 claims path keys are the
+/// top-level member names) + the compact credential form.
+///
+/// # Errors
+/// Never (same degradation contract as [`mdoc_claims`]).
+pub fn sd_jwt_claims(
+    material: &[u8],
+) -> (std::collections::BTreeMap<String, serde_json::Value>, String) {
+    let mut map = std::collections::BTreeMap::new();
+    let text = String::from_utf8_lossy(material).to_string();
+    // The compact form: header.payload~disclosures~ - the payload is
+    // the second segment.
+    if let Some(part) = text.split('.').nth(1) {
+        use base64::Engine;
+        if let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                if let Some(obj) = v.as_object() {
+                    for (k, val) in obj {
+                        if k.starts_with('_') {
+                            continue; // the selective-disclosure markers
+                        }
+                        map.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+    (map, text)
 }
 
 /// Resolve the caller's user id (the BFF proxy carries the verified
@@ -131,12 +249,14 @@ pub async fn build_state(
         .expect("the derived dev key is a valid master key");
     let wallet_client_id = std::env::var("WALLET8_HOLDER_CLIENT_ID")
         .unwrap_or_else(|_| "wallet8-web".to_string());
+    let valkey_url = core.config.valkey_url.clone();
     Ok(AppState {
         pool: core.pool.clone(),
         env_id,
         data_key,
         data_key_seed,
         wallet_client_id,
+        valkey_url,
     })
 }
 

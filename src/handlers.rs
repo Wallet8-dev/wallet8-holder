@@ -557,30 +557,80 @@ pub struct ResolveRequest {
     tag = "holder",
 )]
 pub async fn presentation_resolve(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
     Json(req): Json<ResolveRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let user_id = crate::server::caller_user_id(&query).await?;
-    let _ = (user_id, req);
-    // The request-object fetch + parse + the DCQL match (the Rust
-    // SDK's oid4vp driver) - the endpoint answers the consent preview
-    // or the error the app renders as the error screen. The full
-    // wiring lands with the trust-anchor verify (the platform's
-    // wallet-connection surface provides the anchors).
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        "the presentation resolve lands with the trust-anchor wiring \
-         (the request-object fetch + the DCQL match)"
-            .into(),
-    ))
+    // The request-object fetch (5.4 option 3 / RFC 9101: the
+    // request_uri serves the request object).
+    let http = state.http_client();
+    let object = http
+        .get(&req.request_uri)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("request object fetch: {e}")))?
+        .text()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("request object read: {e}")))?;
+    // The JAR payload (the signed object's claims - the signature
+    // verify rides the trust-anchor surface; the shape gate runs
+    // first: a malformed request never reaches the consent screen).
+    let payload = crate::server::jar_claims(&object)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let request = wallet8::oid4vp::parse_request(&payload)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    wallet8::oid4vp::check_request_shape(&request)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let query = request
+        .dcql_query
+        .as_ref()
+        .ok_or((StatusCode::BAD_REQUEST, "the request carries no dcql_query (5.1)".into()))?;
+    // The vault snapshot (the user's holdings) - the sealed rows open
+    // for the DCQL evaluation (6.4).
+    let holdings = state.user_holdings(&user_id).await?;
+    let matches = wallet8::oid4vp::evaluate_dcql(query, &holdings)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    // The consent preview (6.4.3: what the wallet shows the user).
+    let preview: Vec<serde_json::Value> = matches
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "query_id": m.query.id,
+                "format": m.credential.format,
+                "doctype": m.credential.doctype,
+                "vct": m.credential.vct,
+                "claims": m.selected_claim_paths.iter().map(|p| wallet8::oid4vp::claim_path_display(p)).collect::<Vec<_>>(),
+                "verifier": request.client_id,
+                "require_cryptographic_holder_binding": m.query.require_cryptographic_holder_binding,
+            })
+        })
+        .collect();
+    // The resolved request rides the session alias (the present step
+    // re-reads it; the app never re-fetches the verifier).
+    let session_key = format!("vp:req:{}", uuid::Uuid::new_v4());
+    {
+        use glide::AsyncCommands as _;
+        let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let _: Result<(), _> = conn
+            .set_ex(&session_key, payload.clone(), 600u64)
+            .await;
+    }
+    Ok(Json(serde_json::json!({
+        "session": session_key,
+        "verifier": request.client_id,
+        "nonce": request.nonce,
+        "credentials": preview,
+    })))
 }
 
 /// The presentation-deliver request (the post-consent flow).
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct PresentRequest {
-    /// The scanned verifier request_uri.
-    pub request_uri: String,
+    /// The resolve step's session key.
+    pub session: String,
     /// The user's consent decision.
     pub approved: bool,
 }
@@ -598,17 +648,95 @@ pub struct PresentRequest {
     tag = "holder",
 )]
 pub async fn presentation_deliver(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
     Json(req): Json<PresentRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let user_id = crate::server::caller_user_id(&query).await?;
-    let _ = user_id;
-    let _ = req;
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        "the presentation delivery lands with the trust-anchor wiring \
-         (the vp_token assembly + the response submission)"
-            .into(),
-    ))
+    // The consent gate (15.1: explicit consent before any release).
+    if !req.approved {
+        return Ok(Json(wallet8::oid4vp::error_response(
+            wallet8::oid4vp::WalletError::AccessDenied,
+            "the user declined to share the requested credentials (8.5)",
+            None,
+        )));
+    }
+    // The resolve step's session (the resolved request object).
+    use glide::AsyncCommands as _;
+    let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let payload: Option<String> = conn
+        .get(format!("vp:req:{}", req.session.trim_start_matches("vp:req:")))
+        .await
+        .ok()
+        .flatten();
+    let payload = payload
+        .ok_or((StatusCode::NOT_FOUND, "the presentation session expired".into()))?;
+    let request = wallet8::oid4vp::parse_request(&payload)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    wallet8::oid4vp::check_request_shape(&request)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let dcql = request
+        .dcql_query
+        .as_ref()
+        .ok_or((StatusCode::BAD_REQUEST, "the request carries no dcql_query (5.1)".into()))?;
+    // The holdings + the 6.4 evaluation + the 8.1 assembly (the mdoc
+    // DeviceResponse over the B.2.6 transcripts; the sd-jwt + KB).
+    let holdings = state.user_holdings(&user_id).await?;
+    let matches = wallet8::oid4vp::evaluate_dcql(dcql, &holdings)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let device_key = state.device_key(&user_id).await?;
+    let vp_token = wallet8::oid4vp::build_vp_token(&matches, &device_key, &request, None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // The delivery (8.2 direct_post; the 200 JSON may carry the
+    // redirect_uri the app must open in the browser).
+    let http = state.http_client();
+    let response_uri = request
+        .response_uri
+        .clone()
+        .ok_or((StatusCode::BAD_REQUEST, "the request carries no response_uri (8.2)".into()))?;
+    let outcome = wallet8::oid4vp::post_response(&http, &response_uri, &vp_token, request.state.as_deref())
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    // The history record (the same transaction).
+    let disclosed: Vec<String> = matches
+        .iter()
+        .map(|m| m.query.id.clone())
+        .collect();
+    let formats: Vec<String> = matches
+        .iter()
+        .map(|m| m.credential.format.clone())
+        .collect();
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = sqlx::query("SELECT sentin8_set_tenant_context($1)")
+        .bind(state.env_id)
+        .execute(&mut *tx)
+        .await;
+    sqlx::query!(
+        r#"INSERT INTO holder.presentations
+             (id, env_id, user_id, verifier_client_id, verifier_host,
+              disclosed_claims, formats)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        Uuid::new_v4(),
+        state.env_id,
+        user_id,
+        request.client_id,
+        response_uri,
+        &disclosed,
+        &formats,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = tx.commit().await;
+    Ok(Json(serde_json::json!({
+        "status": "presented",
+        "redirect_uri": outcome.redirect_uri,
+        "presented": matches.iter().map(|m| m.query.id.clone()).collect::<Vec<_>>(),
+    })))
 }
