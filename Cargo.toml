@@ -1,0 +1,42 @@
+[package]
+name = "wallet8-holder"
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Wallet8-dev/wallet8-holder"
+rust-version = "1.85"
+description = "Wallet8 Holder - the encrypted credential vault: stored credentials (secret-reference-only), device-key registration, presentation history, status checks."
+
+[[bin]]
+name = "wallet8-holder"
+path = "src/main.rs"
+
+[lib]
+name = "wallet8_holder_server"
+path = "src/lib.rs"
+
+[dependencies]
+# Platform SDK pin (RS 2.3) - the only cross-repo platform dependency.
+sentin8 = { git = "https://github.com/Sentin8/sentin8-sdk", tag = "sdk-v1.1.0" }
+# wallet8 namespace facade pin - the wallet clients + contracts.
+wallet8 = { git = "https://github.com/Wallet8-dev/wallet8-sdk", tag = "wallet8-v1.0.0" }
+
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "compression-gzip", "limit"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+anyhow = "1"
+base64 = "0.22"
+sha2 = "0.10"
+p256 = { version = "0.13", features = ["ecdsa", "ecdsa-core", "pem"] }
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
