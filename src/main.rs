@@ -19,6 +19,14 @@ mod registration;
 #[allow(dead_code)]
 mod server;
 
+/// The OpenAPI dump the registration embeds (the crate-root static
+/// the registration module reads).
+#[cfg_attr(test, allow(dead_code))]
+static OPENAPI_DUMP: fn() -> serde_json::Value = || {
+    use utoipa::OpenApi as _;
+    serde_json::to_value(openapi::HolderOpenApi::openapi()).unwrap_or(serde_json::Value::Null)
+};
+
 use utoipa::OpenApi;
 
 #[tokio::main]
@@ -28,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
             .with_registration(registration::print)
             .with_state(server::build_state)
             .with_own_health()
-            .with_router(|router, _state| server::routes(router))
+            .with_router(|router, state| server::routes(router, state))
             .with_openapi(openapi::HolderOpenApi::openapi()),
     )
     .await

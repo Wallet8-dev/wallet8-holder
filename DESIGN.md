@@ -25,11 +25,38 @@ vault's data key), and the routes.
 
 ## 3. Data Model
 
-The three RLS-forced tables (`credentials`, `device_keys`,
-`presentations`) - see the vertical DESIGN.md §3. The credential
-material column (`credential_ct`) stores the AES-256-GCM envelope
-(`sentin8::crypto::seal_str`); the key derives from the
-`WALLET8_HOLDER_DATA_KEY` service secret.
+The three RLS-forced tables under the service's own `holder` schema
+inside the wallet8 vertical database (schema-per-service, DBX §6.6 -
+the same layout bank8:ledger's `ledger.*` uses): `holder.credentials`,
+`holder.device_keys`, `holder.presentations` - see the vertical
+DESIGN.md §3. The credential material column (`credential_ct`) stores
+the AES-256-GCM envelope (`sentin8::crypto::seal_str`); the key
+derives from the `WALLET8_HOLDER_DATA_KEY` service secret. Every
+query is schema-qualified (no search_path dependence).
+
+## 3a. Spec-first implementation (the governing directive)
+
+The wallet8 SDK clients are implementations of the normative
+specifications - not test-shaped adapters. The OIDF conformance suite
+VERIFIES behavior; the contracts are the specifications themselves:
+
+- **OID4VCI 1.0 Final** (16 Sep 2025) - the issuance client: offer
+  intake by value/reference (§4.1.2/4.1.3), the metadata identity
+  check (§12.2.2), the authorization-server selection (§12.2.4), the
+  pre-authorized exchange + tx_code (§6.1), the anonymous form
+  (§12.3), the nonce endpoint (§7), the jwt proof (App. F.1), the
+  credential endpoint (§8.2/8.3), the deferred form (§9), the
+  notifications (§11).
+- **OID4VP 1.0 Final** (9 Jul 2025) - the presentation client: the
+  request shape gate (§5.1/5.2/8.2), DCQL (§6) with the exact §6.4.1
+  claim_sets + §6.4.2 credential_sets selection rules, the claims
+  path pointer (§7), the vp_token (§8.1), direct_post (§8.2), the
+  error vocabulary (§8.5), the KB-JWT (B.3.6), the B.2.6.1/6.2
+  session transcripts, the DC API origins (App. A).
+
+Every SDK function cites its section. When a suite check and the
+specification disagree, the specification wins - and the suite
+finding is re-examined against the text.
 
 ## 4. API Surface
 

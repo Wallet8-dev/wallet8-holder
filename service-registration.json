@@ -1,0 +1,12 @@
+{
+  "vertical": "wallet8",
+  "services": [
+    {
+      "service_type": "wallet8:holder",
+      "telemetry_property": {
+        "slug": "holder",
+        "name": "Wallet8:Holder Telemetry"
+      }
+    }
+  ]
+}
