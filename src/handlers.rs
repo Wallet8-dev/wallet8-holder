@@ -318,6 +318,11 @@ fn jwk_thumbprint(jwk: &serde_json::Value) -> Result<String, (StatusCode, String
 pub struct IntakeRequest {
     /// The scanned offer URL (the issuer's credential-offer landing).
     pub offer_url: String,
+    /// The End-User's Transaction Code (§4.1.1 - REQUIRED when the
+    /// offer's grants carry a tx_code object; the §13.6.1 replay
+    /// defense).
+    #[serde(default)]
+    pub tx_code: Option<String>,
 }
 
 /// `POST /v1/issuance/intake` - the full issuance flow (the wallet's
@@ -395,8 +400,8 @@ pub async fn issuance_intake(
         })
         .ok_or((
             StatusCode::NOT_IMPLEMENTED,
-            "the authorization-code intake lands with the browser round \
-             (the PAR orchestration endpoint pair)"
+            "the authorization-code intake lands with the prepare/complete \
+             orchestration pair (the /v1/issuance/prepare endpoint)"
                 .into(),
         ))?;
     let as_identifier = wallet8::oid4vci::select_authorization_server(
@@ -414,11 +419,22 @@ pub async fn issuance_intake(
     } else {
         Some(state.wallet_client_id.as_str())
     };
-    // The tx_code VALUE comes from the End-User; the first intake
-    // pass supplies an empty string for the present-but-unfilled
-    // object (4.1.1 demands the parameter; the interactive prompt
-    // lands with the app's consent UI).
-    let tx_code_value: Option<String> = grant.1.as_ref().map(|_| String::new());
+    // The tx_code VALUE comes from the End-User (§4.1.1: a present
+    // tx_code object makes the token request's tx_code REQUIRED -
+    // §6.3 answers invalid_request when it is missing; the §13.6.1
+    // replay defense demands the End-User channel).
+    let tx_code_value: Option<String> = match &grant.1 {
+        Some(_requirements) => {
+            let value = req.tx_code.clone().filter(|v| !v.trim().is_empty()).ok_or((
+                StatusCode::BAD_REQUEST,
+                "the offer demands a tx_code (4.1.1) - the End-User's \
+                 Transaction Code is REQUIRED for this intake"
+                    .into(),
+            ))?;
+            Some(value)
+        }
+        None => None,
+    };
     let access_token = {
         let token = wallet8::oid4vci::exchange_pre_authorized(
             &http,
@@ -476,18 +492,45 @@ pub async fn issuance_intake(
     // (5) The vault store (8.3: the immediate form stores; the
     //     deferred form records the transaction for the 9 poll; the
     //     11 notification rides the notification_id).
-    let minted = match response {
-        wallet8::oid4vci::CredentialResponse::Issued(creds) => creds
-            .first()
-            .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (8.3)".into()))?
-            .clone(),
-        wallet8::oid4vci::CredentialResponse::Deferred { .. } => {
-            return Err((
-                StatusCode::ACCEPTED,
-                "the issuer deferred the credential (9) - the poll \
-                 orchestration lands with the app's pending state"
-                    .into(),
-            ))
+    // §8.3/§11: the immediate form carries the optional
+    // notification_id; the deferred form parks it (below).
+    let (minted, notification_id) = match response {
+        wallet8::oid4vci::CredentialResponse::Issued(creds) => (
+            creds
+                .first()
+                .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (8.3)".into()))?
+                .clone(),
+            None::<String>,
+        ),
+        // §9: the deferred form parks the transaction - the app
+        // polls /v1/issuance/deferred after `interval`.
+        wallet8::oid4vci::CredentialResponse::Deferred { transaction_id, interval, notification_id } => {
+            let deferred_session = format!("vci:deferred:{transaction_id}");
+            {
+                use glide::AsyncCommands as _;
+                let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                let parked = serde_json::json!({
+                    "credential_issuer": offer.credential_issuer,
+                    "credential_endpoint": metadata.credential_endpoint,
+                    "notification_endpoint": metadata.notification_endpoint,
+                    "notification_id": notification_id,
+                    "config_id": config_id,
+                    "format": configuration.get("format").and_then(|f| f.as_str()).unwrap_or("mso_mdoc"),
+                    "doctype": configuration.get("doctype").and_then(|d| d.as_str()),
+                    "vct": configuration.get("vct").and_then(|v| v.as_str()),
+                    "access_token": access_token,
+                });
+                let _: Result<(), _> = conn
+                    .set_ex(&deferred_session, parked.to_string(), 86400u64)
+                    .await;
+            }
+            return Ok(Json(serde_json::json!({
+                "status": "deferred",
+                "transaction_id": transaction_id,
+                "interval": interval,
+            })));
         }
     };
     let format = configuration
@@ -527,6 +570,22 @@ pub async fn issuance_intake(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let _ = tx.commit().await;
+    // §11: the notification rides the response's notification_id -
+    // the issuer's status surface (credential_accepted, 11.1; the
+    // issuer treats notifications as idempotent).
+    if let (Some(endpoint), Some(notification_id)) =
+        (metadata.notification_endpoint.as_deref(), notification_id.as_deref())
+    {
+        let _ = wallet8::oid4vci::send_notification(
+            &http,
+            endpoint,
+            &access_token,
+            notification_id,
+            wallet8::oid4vci::NotificationEvent::CredentialAccepted,
+            None,
+        )
+        .await;
+    }
     Ok(Json(serde_json::json!({
         "id": row_id,
         "format": format,
@@ -542,6 +601,10 @@ pub async fn issuance_intake(
 pub struct ResolveRequest {
     /// The scanned verifier request_uri.
     pub request_uri: String,
+    /// The platform-asserted origin (the DC API channel - App. A.2);
+    /// None on the redirect channels.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 /// `POST /v1/presentation/resolve` - the pre-consent preview: parse
@@ -549,6 +612,11 @@ pub struct ResolveRequest {
 /// vault, and return the requested claims + the verifier identity
 /// (the consent screen; a malformed/unsafe request answers the
 /// error - the app renders the error screen).
+///
+/// The §5.9 verification runs BEFORE the shape gate (§15.8 - a bad
+/// signature never reaches the DCQL or the consent screen); the
+/// scope alias resolves against the registry (§5.5); the
+/// expected_origins check runs on the DC API channel (App. A.2).
 #[utoipa::path(
     post,
     path = "/v1/presentation/resolve",
@@ -573,14 +641,20 @@ pub async fn presentation_resolve(
         .text()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("request object read: {e}")))?;
-    // The JAR payload (the signed object's claims - the signature
-    // verify rides the trust-anchor surface; the shape gate runs
-    // first: a malformed request never reaches the consent screen).
-    let payload = crate::server::jar_claims(&object)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let request = wallet8::oid4vp::parse_request(&payload)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // §5.9 + §15.8: the signature + the per-prefix rules verify
+    // FIRST - fail-closed, the visible error the app renders.
+    let request = wallet8::oid4vp::verify_request_object(&object, &state.verifier_trust)
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{}: {}", e.code, e.description)))?;
+    // The shape gate (§5.1/5.2 - includes the transaction_data
+    // rejection §8.4).
     wallet8::oid4vp::check_request_shape(&request)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // The DC API origin check (App. A.2).
+    wallet8::oid4vp::check_expected_origins(&request, req.origin.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // The scope alias resolution (§5.5) - a scope request maps to
+    // the DCQL query the registry defines.
+    let request = wallet8::oid4vp::resolve_scope_alias(&request, &state.scope_registry)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let query = request
         .dcql_query
@@ -614,16 +688,32 @@ pub async fn presentation_resolve(
         let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let payload = serde_json::to_string(&request)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let _: Result<(), _> = conn
-            .set_ex(&session_key, payload.clone(), 600u64)
+            .set_ex(&session_key, payload, 600u64)
             .await;
     }
+    let host = request
+        .response_uri
+        .as_deref()
+        .or(request.redirect_uri.as_deref())
+        .and_then(|u| url_host(u))
+        .unwrap_or("");
     Ok(Json(serde_json::json!({
         "session": session_key,
-        "verifier": request.client_id,
+        "verifier_client_id": request.client_id,
+        "verifier_host": host,
+        "response_mode": request.response_mode.clone().unwrap_or_else(|| "direct_post".into()),
         "nonce": request.nonce,
         "credentials": preview,
     })))
+}
+
+/// The URL's host member (the preview's display form).
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    rest.split('/').next()
 }
 
 /// The presentation-deliver request (the post-consent flow).
@@ -633,6 +723,10 @@ pub struct PresentRequest {
     pub session: String,
     /// The user's consent decision.
     pub approved: bool,
+    /// The platform-asserted origin (the DC API channel - App. A.4;
+    /// None on the redirect channels).
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 /// `POST /v1/presentation/present` - the post-consent delivery: the
@@ -640,6 +734,11 @@ pub struct PresentRequest {
 /// the direct_post/dc_api submission; the history record rides the
 /// same transaction. A denied/unsatisfiable request answers the
 /// prescribed error - never an empty vp_token.
+///
+/// The delivery channel follows the response_mode: `direct_post` /
+/// `direct_post.jwt` (§8.2/§8.3.1 - the .jwt form posts
+/// `response=<JWE>`), or `dc_api`/`dc_api.jwt` (App. A.4 - the
+/// response returns to the caller's promise, no back-channel).
 #[utoipa::path(
     post,
     path = "/v1/presentation/present",
@@ -653,14 +752,6 @@ pub async fn presentation_deliver(
     Json(req): Json<PresentRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let user_id = crate::server::caller_user_id(&query).await?;
-    // The consent gate (15.1: explicit consent before any release).
-    if !req.approved {
-        return Ok(Json(wallet8::oid4vp::error_response(
-            wallet8::oid4vp::WalletError::AccessDenied,
-            "the user declined to share the requested credentials (8.5)",
-            None,
-        )));
-    }
     // The resolve step's session (the resolved request object).
     use glide::AsyncCommands as _;
     let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
@@ -673,9 +764,23 @@ pub async fn presentation_deliver(
         .flatten();
     let payload = payload
         .ok_or((StatusCode::NOT_FOUND, "the presentation session expired".into()))?;
-    let request = wallet8::oid4vp::parse_request(&payload)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let request: wallet8::oid4vp::AuthorizationRequest = serde_json::from_str(&payload)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("the session request parse: {e}")))?;
+    // The consent gate (15.1: explicit consent before any release).
+    if !req.approved {
+        return Ok(Json(wallet8::oid4vp::error_response(
+            wallet8::oid4vp::WalletError::AccessDenied,
+            "the user declined to share the requested credentials (8.5)",
+            request.state.as_deref(),
+        )));
+    }
+    // The re-gate on the deliver step (the session is the source of
+    // truth; the shape + origin checks run again).
     wallet8::oid4vp::check_request_shape(&request)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    wallet8::oid4vp::check_expected_origins(&request, req.origin.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let request = wallet8::oid4vp::resolve_scope_alias(&request, &state.scope_registry)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let dcql = request
         .dcql_query
@@ -687,18 +792,63 @@ pub async fn presentation_deliver(
     let matches = wallet8::oid4vp::evaluate_dcql(dcql, &holdings)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let device_key = state.device_key(&user_id).await?;
-    let vp_token = wallet8::oid4vp::build_vp_token(&matches, &device_key, &request, None)
+    let vp_token = wallet8::oid4vp::build_vp_token(&matches, &device_key, &request, req.origin.as_deref())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    // The delivery (8.2 direct_post; the 200 JSON may carry the
-    // redirect_uri the app must open in the browser).
-    let http = state.http_client();
-    let response_uri = request
-        .response_uri
-        .clone()
-        .ok_or((StatusCode::BAD_REQUEST, "the request carries no response_uri (8.2)".into()))?;
-    let outcome = wallet8::oid4vp::post_response(&http, &response_uri, &vp_token, request.state.as_deref())
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    // The delivery per the response_mode (§8.2/§8.3.1/App. A.4).
+    let mode = request.response_mode.as_deref().unwrap_or("direct_post");
+    let (outcome, response_json) = match mode {
+        // App. A.4: the response rides the promise - the app
+        // resolves it; NO back-channel post.
+        "dc_api" => {
+            let response = wallet8::oid4vp::dc_api_response(&vp_token, request.state.as_deref(), None)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            (None, response)
+        }
+        "dc_api.jwt" => {
+            let response = wallet8::oid4vp::dc_api_response(
+                &vp_token,
+                request.state.as_deref(),
+                Some(&request.client_metadata),
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            (None, response)
+        }
+        // §8.3.1: the encrypted form posts response=<JWE>.
+        "direct_post.jwt" => {
+            let response_uri = request.response_uri.clone().ok_or((
+                StatusCode::BAD_REQUEST,
+                "the request carries no response_uri (8.2)".into(),
+            ))?;
+            let http = state.http_client();
+            let result = wallet8::oid4vp::post_response_encrypted(
+                &http,
+                &response_uri,
+                &vp_token,
+                request.state.as_deref(),
+                &request.client_metadata,
+            )
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            (Some(result.redirect_uri), serde_json::json!({"status": "presented"}))
+        }
+        // §8.2: the plain form posts vp_token=.
+        _ => {
+            let response_uri = request
+                .response_uri
+                .clone()
+                .ok_or((StatusCode::BAD_REQUEST, "the request carries no response_uri (8.2)".into()))?;
+            let http = state.http_client();
+            let result = wallet8::oid4vp::post_response(
+                &http,
+                &response_uri,
+                &vp_token,
+                request.state.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            (Some(result.redirect_uri), serde_json::json!({"status": "presented"}))
+        }
+    };
     // The history record (the same transaction).
     let disclosed: Vec<String> = matches
         .iter()
@@ -726,7 +876,11 @@ pub async fn presentation_deliver(
         state.env_id,
         user_id,
         request.client_id,
-        response_uri,
+        request
+            .response_uri
+            .clone()
+            .or(request.redirect_uri.clone())
+            .unwrap_or_default(),
         &disclosed,
         &formats,
     )
@@ -734,9 +888,633 @@ pub async fn presentation_deliver(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let _ = tx.commit().await;
-    Ok(Json(serde_json::json!({
+    let mut out = serde_json::json!({
         "status": "presented",
-        "redirect_uri": outcome.redirect_uri,
         "presented": matches.iter().map(|m| m.query.id.clone()).collect::<Vec<_>>(),
+    });
+    if let Some(redirect) = outcome.flatten() {
+        out["redirect_url"] = serde_json::json!(redirect);
+    }
+    // The DC API forms merge the promise payload.
+    if mode == "dc_api" || mode == "dc_api.jwt" {
+        out = response_json;
+    }
+    Ok(Json(out))
+}
+
+// ── The authorization-code orchestration (§3.4 + §11.5) ──────────────
+
+/// The prepare request (the offer intake -> the authorize URL).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct PrepareRequest {
+    /// The scanned offer URL.
+    pub offer_url: String,
+}
+
+/// The complete request (the browser callback -> the credential).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CompleteRequest {
+    /// The prepare step's session key.
+    pub session: String,
+    /// The authorization response's code.
+    pub code: String,
+    /// The authorization response's state (MUST match the pushed
+    /// state - §5.2's CSRF defense).
+    pub state: String,
+}
+
+/// `POST /v1/issuance/prepare` - the authorization-code round's first
+/// half (§3.4/§5.1.4): parse the offer, resolve the metadata, push
+/// the PAR (with `authorization_details` type `openid_credential`
+/// §5.1.1), and return the authorize URL - the app opens the
+/// browser round. The session (offer + metadata + PKCE + state)
+/// parks in Valkey keyed by the session id.
+#[utoipa::path(
+    post,
+    path = "/v1/issuance/prepare",
+    request_body = PrepareRequest,
+    responses((status = 200, description = "The authorize URL + the session")),
+    tag = "holder",
+)]
+pub async fn issuance_prepare(
+    State(state): State<AppState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    Json(req): Json<PrepareRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let user_id = crate::server::caller_user_id(&query).await?;
+    let http = state.http_client();
+    // (1) The offer (4.1.2/4.1.3).
+    let offer_body = match wallet8::oid4vci::parse_offer_url(&req.offer_url)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?
+    {
+        wallet8::oid4vci::OfferIntake::ByValue(v) => v,
+        wallet8::oid4vci::OfferIntake::ByReference(uri) => http
+            .get(&uri)
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("offer fetch: {e}")))?
+            .text()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("offer read: {e}")))?,
+    };
+    let offer = wallet8::oid4vci::parse_credential_offer(&offer_body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // (2) The metadata (12.2.2) + the offered configuration.
+    let metadata = wallet8::oid4vci::resolve_issuer_metadata(&http, &offer.credential_issuer)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let config_id = offer
+        .credential_configuration_ids
+        .first()
+        .ok_or((StatusCode::BAD_REQUEST, "the offer lists no configurations (4.1.1)".into()))?
+        .clone();
+    // The authorization-server selection: the authorization_code
+    // grant's hint or the metadata's list (12.2.4).
+    let hint = offer.grants.iter().find_map(|g| match g {
+        wallet8::oid4vci::OfferGrant::AuthorizationCode { issuer_state: _, authorization_server } => {
+            authorization_server.clone()
+        }
+        _ => None,
+    });
+    let as_identifier = wallet8::oid4vci::select_authorization_server(&metadata, hint.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let as_metadata = wallet8::oid4vci::resolve_as_metadata(&http, &as_identifier)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let par_endpoint = as_metadata
+        .pushed_authorization_request_endpoint
+        .clone()
+        .ok_or((StatusCode::NOT_IMPLEMENTED, "the AS advertises no PAR endpoint (5.1.4/9126)".into()))?;
+    // (3) The PAR push (5.1.4) - the authorization_details form
+    // (5.1.1) with the locations member when the metadata lists
+    // multiple authorization_servers.
+    let locations = if metadata.authorization_servers.len() > 1 {
+        Some(offer.credential_issuer.as_str())
+    } else {
+        None
+    };
+    let details = wallet8::oid4vci::authorization_details(&config_id, locations, None);
+    let issuer_state = offer.grants.iter().find_map(|g| match g {
+        wallet8::oid4vci::OfferGrant::AuthorizationCode { issuer_state, .. } => {
+            issuer_state.clone()
+        }
+        _ => None,
+    });
+    let (_request_uri, oauth_state, pkce) = wallet8::oid4vci::push_authorization_request(
+        &http,
+        &par_endpoint,
+        &state.wallet_client_id,
+        &format!("https://wallet8.local/cb"),
+        &details,
+        issuer_state.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    // (4) The session parks (600s - the PAR expiry window).
+    let session = format!("vci:prepare:{}", uuid::Uuid::new_v4());
+    {
+        use glide::AsyncCommands as _;
+        let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let parked = serde_json::json!({
+            "user_id": user_id.to_string(),
+            "offer": offer_body,
+            "credential_issuer": offer.credential_issuer,
+            "config_id": config_id,
+            "as_metadata": as_metadata,
+            "metadata": metadata,
+            "pkce_verifier": pkce.verifier,
+            "oauth_state": oauth_state,
+            "credential_issuer": offer.credential_issuer,
+        });
+        let _: Result<(), _> = conn
+            .set_ex(&session, parked.to_string(), 600u64)
+            .await;
+    }
+    // (5) The authorize URL (9126 §5: client_id + request_uri only).
+    let authorize_url = wallet8::oid4vci::par_authorize_url(
+        &as_metadata.authorization_endpoint,
+        &state.wallet_client_id,
+        &_request_uri,
+    );
+    Ok(Json(serde_json::json!({
+        "session": session,
+        "authorize_url": authorize_url,
+    })))
+}
+
+/// `POST /v1/issuance/complete` - the authorization-code round's
+/// second half (§3.4): verify the state, exchange the code (PKCE),
+/// fetch the nonce, mint the proof, request the credential, store,
+/// and send the notification (§11) on the notification_id.
+#[utoipa::path(
+    post,
+    path = "/v1/issuance/complete",
+    request_body = CompleteRequest,
+    responses((status = 200, description = "The stored credential view")),
+    tag = "holder",
+)]
+pub async fn issuance_complete(
+    State(state): State<AppState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    Json(req): Json<CompleteRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _ = crate::server::caller_user_id(&query).await?;
+    use glide::AsyncCommands as _;
+    let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let parked_raw: Option<String> = conn
+        .get(format!("vci:prepare:{}", req.session.trim_start_matches("vci:prepare:")))
+        .await
+        .ok()
+        .flatten();
+    let parked_raw = parked_raw
+        .ok_or((StatusCode::NOT_FOUND, "the issuance session expired".into()))?;
+    let parked: serde_json::Value = serde_json::from_str(&parked_raw)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the session parse: {e}")))?;
+    // The state check (5.2's CSRF defense - the pushed state MUST
+    // match the callback's).
+    let expected_state = parked.get("oauth_state").and_then(|v| v.as_str()).unwrap_or("");
+    if expected_state != req.state {
+        return Err((StatusCode::BAD_REQUEST, "the state does not match the pushed authorization request (5.2)".into()));
+    }
+    let user_id = Uuid::parse_str(parked.get("user_id").and_then(|v| v.as_str()).unwrap_or_default())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the session user: {e}")))?;
+    let credential_issuer = parked
+        .get("credential_issuer")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let config_id = parked
+        .get("config_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let metadata: wallet8::oid4vci::IssuerMetadata =
+        serde_json::from_value(parked.get("metadata").cloned().unwrap_or_default())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the session metadata: {e}")))?;
+    let as_metadata: wallet8::oid4vci::AsMetadata =
+        serde_json::from_value(parked.get("as_metadata").cloned().unwrap_or_default())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the session AS: {e}")))?;
+    let pkce_verifier = parked
+        .get("pkce_verifier")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let http = state.http_client();
+    // (1) The token exchange (6.1: the code + PKCE + the redirect).
+    let token_response = wallet8::oid4vci::exchange_code(
+        &http,
+        &as_metadata.token_endpoint,
+        &state.wallet_client_id,
+        "https://wallet8.local/cb",
+        &req.code,
+        &pkce_verifier,
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let access_token = token_response
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .ok_or((StatusCode::BAD_GATEWAY, "the token response carries no access_token (6.2)".into()))?
+        .to_string();
+    // (2) The target: the credential_identifiers when the token
+    // response carried authorization_details (6.2), else the
+    // configuration id (8.2).
+    let target = match wallet8::oid4vci::credential_identifiers(&token_response) {
+        Some(ids) => wallet8::oid4vci::CredentialRequestTarget::Identifier(
+            ids.first().cloned().ok_or((StatusCode::BAD_GATEWAY, "no credential_identifiers (6.2)".into()))?,
+        ),
+        None => wallet8::oid4vci::CredentialRequestTarget::ConfigurationId(config_id.clone()),
+    };
+    // (3) The nonce pre-flight (7.1) + the proof (F.1) + the
+    // credential request (8.2).
+    let device_key = state.device_key(&user_id).await?;
+    let c_nonce = match &metadata.nonce_endpoint {
+        Some(endpoint) => Some(
+            wallet8::oid4vci::fetch_nonce(&http, endpoint)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?,
+        ),
+        None => None,
+    };
+    let proof = wallet8::oid4vci::mint_jwt_proof(
+        &device_key,
+        Some(state.wallet_client_id.as_str()),
+        &credential_issuer,
+        c_nonce.as_deref(),
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let response = wallet8::oid4vci::request_credential(
+        &http,
+        &metadata.credential_endpoint,
+        &access_token,
+        &wallet8::oid4vci::CredentialRequestBody {
+            target,
+            proofs: serde_json::json!({ "jwt": [proof] }),
+            credential_response_encryption: None,
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    // (4) The store (8.3) + the notification (11).
+    let configuration = metadata
+        .credential_configurations_supported
+        .get(&config_id)
+        .cloned()
+        .unwrap_or_default();
+    let (minted, notification_id) = match response {
+        wallet8::oid4vci::CredentialResponse::Issued(creds) => (
+            creds
+                .first()
+                .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (8.3)".into()))?
+                .credential
+                .clone(),
+            None::<String>,
+        ),
+        wallet8::oid4vci::CredentialResponse::Deferred { transaction_id, interval, notification_id } => {
+            let deferred_session = format!("vci:deferred:{transaction_id}");
+            let deferred_parked = serde_json::json!({
+                "credential_issuer": credential_issuer,
+                "credential_endpoint": metadata.credential_endpoint,
+                "notification_endpoint": metadata.notification_endpoint,
+                "notification_id": notification_id,
+                "config_id": config_id,
+                "format": configuration.get("format").and_then(|f| f.as_str()).unwrap_or("mso_mdoc"),
+                "doctype": configuration.get("doctype").and_then(|d| d.as_str()),
+                "vct": configuration.get("vct").and_then(|v| v.as_str()),
+                "access_token": access_token,
+            });
+            let _: Result<(), _> = conn
+                .set_ex(&deferred_session, deferred_parked.to_string(), 86400u64)
+                .await;
+            return Ok(Json(serde_json::json!({
+                "status": "deferred",
+                "transaction_id": transaction_id,
+                "interval": interval,
+            })));
+        }
+    };
+    let format = configuration
+        .get("format")
+        .and_then(|f| f.as_str())
+        .unwrap_or("mso_mdoc")
+        .to_string();
+    let doctype = configuration.get("doctype").and_then(|d| d.as_str()).map(str::to_string);
+    let vct = configuration.get("vct").and_then(|v| v.as_str()).map(str::to_string);
+    let sealed = sentin8::crypto::seal(&state.data_key, minted.as_bytes())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let row_id = Uuid::new_v4();
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = sqlx::query("SELECT sentin8_set_tenant_context($1)")
+        .bind(state.env_id)
+        .execute(&mut *tx)
+        .await;
+    sqlx::query!(
+        r#"INSERT INTO holder.credentials
+             (id, env_id, user_id, format, doctype, vct, display_name, issuer, credential_ct)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+        row_id,
+        state.env_id,
+        user_id,
+        format,
+        doctype,
+        vct,
+        config_id,
+        credential_issuer,
+        sealed,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = tx.commit().await;
+    if let (Some(endpoint), Some(notification_id)) =
+        (metadata.notification_endpoint.as_deref(), notification_id.as_deref())
+    {
+        let _ = wallet8::oid4vci::send_notification(
+            &http,
+            endpoint,
+            &access_token,
+            notification_id,
+            wallet8::oid4vci::NotificationEvent::CredentialAccepted,
+            None,
+        )
+        .await;
+    }
+    Ok(Json(serde_json::json!({
+        "id": row_id,
+        "format": format,
+        "display_name": config_id,
+        "doctype": doctype,
+        "vct": vct,
+        "issuer": credential_issuer,
+    })))
+}
+
+/// The deferred-poll request (§9).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct DeferredRequest {
+    /// The deferred transaction id.
+    pub transaction_id: String,
+}
+
+/// `POST /v1/issuance/deferred` - the §9 poll: the parked
+/// transaction re-submits (the same access token); the 200 form
+/// stores, the 202 form answers pending. `credential_request_denied`
+/// is terminal (§9.3).
+#[utoipa::path(
+    post,
+    path = "/v1/issuance/deferred",
+    request_body = DeferredRequest,
+    responses((status = 200, description = "The stored credential or the pending marker")),
+    tag = "holder",
+)]
+pub async fn issuance_deferred(
+    State(state): State<AppState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    Json(req): Json<DeferredRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let user_id = crate::server::caller_user_id(&query).await?;
+    use glide::AsyncCommands as _;
+    let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let parked_raw: Option<String> = conn
+        .get(format!("vci:deferred:{}", req.transaction_id))
+        .await
+        .ok()
+        .flatten();
+    let parked_raw = parked_raw
+        .ok_or((StatusCode::NOT_FOUND, "the deferred transaction expired or is unknown".into()))?;
+    let parked: serde_json::Value = serde_json::from_str(&parked_raw)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the parked parse: {e}")))?;
+    let http = state.http_client();
+    // The parked credential endpoint (§8.2's surface; the deferred
+    // endpoint itself re-resolves from the issuer metadata below -
+    // §9.1's deferred_credential_endpoint member).
+    let parked_credential_endpoint = parked
+        .get("credential_endpoint")
+        .and_then(|v| v.as_str())
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "the parked transaction carries no endpoint".into()))?
+        .to_string();
+    // The AS's deferred endpoint (9.1) - the metadata's member.
+    let issuer = parked.get("credential_issuer").and_then(|v| v.as_str()).unwrap_or_default();
+    let metadata = wallet8::oid4vci::resolve_issuer_metadata(&http, issuer)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let deferred_endpoint = metadata
+        .deferred_credential_endpoint
+        .as_deref()
+        .ok_or((StatusCode::NOT_IMPLEMENTED, "the issuer advertises no deferred endpoint (9.1)".into()))?;
+    let access_token = parked
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // The poll (9.1: the transaction_id + the same access token).
+    let answer = wallet8::oid4vci::poll_deferred(&http, deferred_endpoint, &access_token, &req.transaction_id)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    match answer {
+        wallet8::oid4vci::DeferredAnswer::Pending { transaction_id, interval } => Ok(Json(
+            serde_json::json!({"status": "pending", "transaction_id": transaction_id, "interval": interval}),
+        )),
+        wallet8::oid4vci::DeferredAnswer::Issued(creds) => {
+            let minted = creds
+                .first()
+                .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (9.2)".into()))?
+                .credential
+                .clone();
+            let format = parked.get("format").and_then(|v| v.as_str()).unwrap_or("mso_mdoc").to_string();
+            let doctype = parked.get("doctype").and_then(|v| v.as_str()).map(str::to_string);
+            let vct = parked.get("vct").and_then(|v| v.as_str()).map(str::to_string);
+            let config_id = parked.get("config_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let sealed = sentin8::crypto::seal(&state.data_key, minted.as_bytes())
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let row_id = Uuid::new_v4();
+            let mut tx = state
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let _ = sqlx::query("SELECT sentin8_set_tenant_context($1)")
+                .bind(state.env_id)
+                .execute(&mut *tx)
+                .await;
+            sqlx::query!(
+                r#"INSERT INTO holder.credentials
+                     (id, env_id, user_id, format, doctype, vct, display_name, issuer, credential_ct)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+                row_id,
+                state.env_id,
+                user_id,
+                format,
+                doctype,
+                vct,
+                config_id,
+                issuer,
+                sealed,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let _ = tx.commit().await;
+            // The terminal notification (11) when the deferred flow
+            // carried one.
+            if let (Some(endpoint), Some(notification_id)) = (
+                parked.get("notification_endpoint").and_then(|v| v.as_str()),
+                parked.get("notification_id").and_then(|v| v.as_str()),
+            ) {
+                let _ = wallet8::oid4vci::send_notification(
+                    &http,
+                    endpoint,
+                    &access_token,
+                    notification_id,
+                    wallet8::oid4vci::NotificationEvent::CredentialAccepted,
+                    None,
+                )
+                .await;
+            }
+            // The transaction is consumed (9.1: the issuer
+            // invalidates it).
+            let _: Result<(), _> = conn.del(format!("vci:deferred:{}", req.transaction_id)).await;
+            Ok(Json(serde_json::json!({
+                "status": "issued",
+                "id": row_id,
+                "format": format,
+                "display_name": config_id,
+                "doctype": doctype,
+                "vct": vct,
+                "issuer": issuer,
+            })))
+        }
+    }
+}
+
+/// `POST /v1/credentials/sync` - the vault's status walk (§11.6):
+/// every active SD-JWT VC row's `status.status_list` reference is
+/// fetched (TTL-cached) + checked; a non-VALID entry flips the row
+/// to `revoked` (the business event). A fetch failure treats the
+/// credential as unverifiable - fail-closed (TSL §8.3: no statement
+/// = reject).
+#[utoipa::path(
+    post,
+    path = "/v1/credentials/sync",
+    responses((status = 200, description = "The sync summary")),
+    tag = "holder",
+)]
+pub async fn credentials_sync(
+    State(state): State<AppState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let user_id = crate::server::caller_user_id(&query).await?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = sqlx::query("SELECT sentin8_set_tenant_context($1)")
+        .bind(state.env_id)
+        .execute(&mut *tx)
+        .await;
+    let rows = sqlx::query!(
+        r#"SELECT id, format, credential_ct FROM holder.credentials
+           WHERE user_id = $1 AND status = 'active' AND format = 'dc+sd-jwt'"#,
+        user_id,
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = tx.commit().await;
+    let http = state.http_client();
+    let mut revoked = 0usize;
+    let mut checked = 0usize;
+    for row in rows {
+        let material = sentin8::crypto::open_str(&state.data_key, &row.credential_ct)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let text = String::from_utf8_lossy(&material).to_string();
+        // The payload segment (the sd-jwt's claims - the vault's
+        // sd_jwt_claims view).
+        let payload = crate::server::sd_jwt_payload(&text)
+            .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "the stored sd-jwt carries no payload".into()))?;
+        let reference = wallet8::oid4vp::decode_status_reference(&payload)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let Some(reference) = reference else { continue };
+        checked += 1;
+        // The cache-first fetch (TSL 13.7: the Valkey-cached list per
+        // uri; the failure = fail-closed).
+        let cache_key = format!("status:list:{}", reference.uri);
+        let list_jwt: Option<String> = {
+            use glide::AsyncCommands as _;
+            let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            conn.get(&cache_key).await.ok().flatten()
+        };
+        let list = match list_jwt {
+            Some(cached) => wallet8::oid4vp::parse_status_list_token(&cached)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
+            None => {
+                let fetched = wallet8::oid4vp::fetch_status_list(&http, &reference.uri)
+                    .await
+                    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+                // Re-cache (the ttl claim's window; 5 min default).
+                let ttl = fetched.ttl.unwrap_or(300).min(3600);
+                {
+                    use glide::AsyncCommands as _;
+                    let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    // The raw JWT re-fetch: the parsed list re-mints
+                    // unsigned - cache the parsed entries instead.
+                    let parked = serde_json::json!({
+                        "bits": fetched.bits,
+                        "entries": base64::Engine::encode(
+                            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                            &fetched.entries,
+                        ),
+                        "uri": fetched.uri,
+                    });
+                    let _: Result<(), _> = conn
+                        .set_ex(&cache_key, parked.to_string(), ttl)
+                        .await;
+                }
+                fetched
+            }
+        };
+        let value = wallet8::oid4vp::entry_value(&list.entries, list.bits, reference.idx);
+        if !value.presents() {
+            // The flip (the business event:
+            // wallet8:holder:credential:revoked).
+            let mut tx = state
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let _ = sqlx::query("SELECT sentin8_set_tenant_context($1)")
+                .bind(state.env_id)
+                .execute(&mut *tx)
+                .await;
+            sqlx::query!(
+                r#"UPDATE holder.credentials SET status = 'revoked'
+                   WHERE id = $1"#,
+                row.id,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let _ = tx.commit().await;
+            revoked += 1;
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "checked": checked,
+        "revoked": revoked,
     })))
 }

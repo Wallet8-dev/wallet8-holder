@@ -18,7 +18,9 @@ path = "src/lib.rs"
 [dependencies]
 # Platform SDK pin (RS 2.3) - the only cross-repo platform dependency.
 sentin8 = { git = "https://github.com/Sentin8/sentin8-sdk", tag = "sdk-v1.1.2" }
-# wallet8 namespace facade pin - the wallet clients + contracts.
+# wallet8 namespace facade pin - the wallet clients + contracts
+# (the dev-tree [patch] below overrides this with the local SDK
+# workspace until the wallet8-v1.0.1 tag ships).
 wallet8 = { git = "https://github.com/Wallet8-dev/wallet8-sdk", tag = "wallet8-v1.1.1" }
 
 axum = { version = "0.8", features = ["macros"] }
@@ -42,3 +44,12 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+
+# The dev-tree override: the local SDK workspace patches the
+# published pin (the release flow re-tags + drops this section;
+# consumers always resolve the git tag above).
+[patch."https://github.com/Wallet8-dev/wallet8-sdk"]
+wallet8 = { path = "../wallet8-sdk/facade" }
+wallet8-oid4vci-client = { path = "../wallet8-sdk/crates/oid4vci-client" }
+wallet8-oid4vp-client = { path = "../wallet8-sdk/crates/oid4vp-client" }
+wallet8-holder-contracts = { path = "../wallet8-sdk/crates/holder-contracts" }

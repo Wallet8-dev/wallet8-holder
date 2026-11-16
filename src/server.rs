@@ -26,8 +26,14 @@ pub struct AppState {
     /// The wallet's OAuth client id (the authorize rounds).
     pub wallet_client_id: String,
     /// The Valkey URL (the presentation-session store).
-    pub valkey_url: String,
-}
+    pub valkey_url: String,    /// The verifier trust surface (§5.9/§12): the trusted
+    /// verifier-attestation issuers - the ecosystem anchor list
+    /// (deployment configuration; empty = none accepted).
+    pub verifier_trust: wallet8::oid4vp::VerifierTrust,
+    /// The scope-alias registry (§5.5): the wallet's server-metadata
+    /// DCQL aliases - parsed from the WALLET8_HOLDER_SCOPE_ALIASES
+    /// config (a JSON map scope -> DCQL query).
+    pub scope_registry: std::collections::BTreeMap<String, wallet8::oid4vp::DcqlQuery>,}
 
 impl AppState {
     /// The wallet's outbound HTTP client (the issuer/verifier calls).
@@ -128,6 +134,22 @@ pub fn jar_claims(jwt: &str) -> Result<String, String> {
         .decode(part)
         .map_err(|e| format!("the request object payload decode: {e}"))?;
     String::from_utf8(raw).map_err(|e| format!("the request object payload utf8: {e}"))
+}
+
+/// The SD-JWT's parsed payload claims (the vault's sealed material ->
+/// the status reference decode's input - TSL §6.2's Referenced
+/// Token payload).
+///
+/// # Errors
+/// Never returns Err: a malformed SD-JWT answers None (the caller
+/// skips the status check - no reference, no statement).
+pub fn sd_jwt_payload(sd_jwt: &str) -> Option<serde_json::Value> {
+    use base64::Engine;
+    let part = sd_jwt.split('.').nth(1)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(part)
+        .ok()?;
+    serde_json::from_slice(&raw).ok()
 }
 
 /// The mdoc IssuerSigned's disclosed claims (the 7.2 claims path
@@ -250,6 +272,33 @@ pub async fn build_state(
     let wallet_client_id = std::env::var("WALLET8_HOLDER_CLIENT_ID")
         .unwrap_or_else(|_| "wallet8-web".to_string());
     let valkey_url = core.config.valkey_url.clone();
+    // The verifier-attestation issuers (§12's trust anchor - the
+    // ecosystem's deployment data): WALLET8_HOLDER_ATTESTATION_ISSUERS
+    // = a JSON array of {"iss": ..., "jwk": {...}} entries.
+    let verifier_trust = match std::env::var("WALLET8_HOLDER_ATTESTATION_ISSUERS") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+            let mut issuers = Vec::new();
+            if let Some(entries) = parsed.as_array() {
+                for entry in entries {
+                    let iss = entry.get("iss").and_then(|v| v.as_str()).unwrap_or_default();
+                    if let Some(jwk) = entry.get("jwk") {
+                        issuers.push((iss.to_string(), jwk.clone()));
+                    }
+                }
+            }
+            wallet8::oid4vp::VerifierTrust { attestation_issuers: issuers }
+        }
+        _ => wallet8::oid4vp::VerifierTrust::default(),
+    };
+    // The scope-alias registry (§5.5): WALLET8_HOLDER_SCOPE_ALIASES =
+    // a JSON map scope -> DCQL query.
+    let scope_registry = match std::env::var("WALLET8_HOLDER_SCOPE_ALIASES") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            serde_json::from_str::<std::collections::BTreeMap<String, wallet8::oid4vp::DcqlQuery>>(&raw)?
+        }
+        _ => Default::default(),
+    };
     Ok(AppState {
         pool: core.pool.clone(),
         env_id,
@@ -257,11 +306,13 @@ pub async fn build_state(
         data_key_seed,
         wallet_client_id,
         valkey_url,
+        verifier_trust,
+        scope_registry,
     })
 }
 
-/// The route table (DESIGN.md §4). The shell passes the bound state
-/// in - the handlers take `State<AppState>`.
+/// The route table (DESIGN.md §4 + §11.5's orchestration). The shell
+/// passes the bound state in - the handlers take `State<AppState>`.
 pub fn routes(router: axum::Router<AppState>, _state: AppState) -> axum::Router<AppState> {
     router
         .route("/v1/health", get(|| async { "ok" }))
@@ -280,6 +331,21 @@ pub fn routes(router: axum::Router<AppState>, _state: AppState) -> axum::Router<
             "/v1/issuance/intake",
             post(crate::handlers::issuance_intake),
         )
+        // §11.5: the authorization-code round's orchestration pair
+        // (prepare -> the browser authorize round -> complete).
+        .route(
+            "/v1/issuance/prepare",
+            post(crate::handlers::issuance_prepare),
+        )
+        .route(
+            "/v1/issuance/complete",
+            post(crate::handlers::issuance_complete),
+        )
+        // §9: the deferred-issuance poll.
+        .route(
+            "/v1/issuance/deferred",
+            post(crate::handlers::issuance_deferred),
+        )
         .route(
             "/v1/presentation/resolve",
             post(crate::handlers::presentation_resolve),
@@ -287,5 +353,10 @@ pub fn routes(router: axum::Router<AppState>, _state: AppState) -> axum::Router<
         .route(
             "/v1/presentation/present",
             post(crate::handlers::presentation_deliver),
+        )
+        // §11.6: the vault's status sync (the revocation walk).
+        .route(
+            "/v1/credentials/sync",
+            post(crate::handlers::credentials_sync),
         )
 }

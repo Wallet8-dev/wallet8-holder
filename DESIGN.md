@@ -38,7 +38,9 @@ query is schema-qualified (no search_path dependence).
 
 The wallet8 SDK clients are implementations of the normative
 specifications - not test-shaped adapters. The OIDF conformance suite
-VERIFIES behavior; the contracts are the specifications themselves:
+VERIFIES behavior; the contracts are the specifications themselves
+(the full baseline catalog: the vertical's `BUSINESS.md` §3; the
+section-by-section map: the vertical's `DESIGN.md` §3a):
 
 - **OID4VCI 1.0 Final** (16 Sep 2025) - the issuance client: offer
   intake by value/reference (§4.1.2/4.1.3), the metadata identity
@@ -53,6 +55,10 @@ VERIFIES behavior; the contracts are the specifications themselves:
   path pointer (§7), the vp_token (§8.1), direct_post (§8.2), the
   error vocabulary (§8.5), the KB-JWT (B.3.6), the B.2.6.1/6.2
   session transcripts, the DC API origins (App. A).
+- The vault's own obligations come from the same texts: encrypted
+  storage (OID4VCI §15.3), the presentation-history audit (OID4VP
+  §15.1), and the status checks (IETF Token Status List draft-14;
+  ISO/IEC 18013-7 deferred per the vertical DESIGN.md §10).
 
 Every SDK function cites its section. When a suite check and the
 specification disagree, the specification wins - and the suite
