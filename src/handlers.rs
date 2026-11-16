@@ -1295,15 +1295,9 @@ pub async fn issuance_deferred(
     let parked: serde_json::Value = serde_json::from_str(&parked_raw)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the parked parse: {e}")))?;
     let http = state.http_client();
-    // The parked credential endpoint (§8.2's surface; the deferred
-    // endpoint itself re-resolves from the issuer metadata below -
-    // §9.1's deferred_credential_endpoint member).
-    let parked_credential_endpoint = parked
-        .get("credential_endpoint")
-        .and_then(|v| v.as_str())
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "the parked transaction carries no endpoint".into()))?
-        .to_string();
-    // The AS's deferred endpoint (9.1) - the metadata's member.
+    // The AS's deferred endpoint (9.1) - re-resolved from the issuer
+    // metadata (§9.1's deferred_credential_endpoint member); the
+    // parked rows carry the issuer identifier + the access token.
     let issuer = parked.get("credential_issuer").and_then(|v| v.as_str()).unwrap_or_default();
     let metadata = wallet8::oid4vci::resolve_issuer_metadata(&http, issuer)
         .await

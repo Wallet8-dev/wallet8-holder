@@ -37,7 +37,7 @@ query is schema-qualified (no search_path dependence).
 ## 3a. Spec-first implementation (the governing directive)
 
 The wallet8 SDK clients are implementations of the normative
-specifications - not test-shaped adapters. The OIDF conformance suite
+specifications, section by section. The OIDF conformance suite
 VERIFIES behavior; the contracts are the specifications themselves
 (the full baseline catalog: the vertical's `BUSINESS.md` §3; the
 section-by-section map: the vertical's `DESIGN.md` §3a):
