@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, verifier_client_id, verifier_host,\n                  disclosed_claims, formats, presented_at\n           FROM holder.presentations\n           WHERE user_id = $1\n           ORDER BY presented_at DESC\n           LIMIT 100",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "verifier_client_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "verifier_host",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "disclosed_claims",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "formats",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 5,
+        "name": "presented_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b91a641a32693fb80591caf36b393a442956b1a2255caf91d3b89dbe27190b0a"
+}

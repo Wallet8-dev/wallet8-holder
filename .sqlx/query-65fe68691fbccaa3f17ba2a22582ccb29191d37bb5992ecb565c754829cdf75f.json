@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO holder.credentials\n                     (id, env_id, user_id, format, doctype, vct, display_name, issuer, credential_ct)\n                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "65fe68691fbccaa3f17ba2a22582ccb29191d37bb5992ecb565c754829cdf75f"
+}

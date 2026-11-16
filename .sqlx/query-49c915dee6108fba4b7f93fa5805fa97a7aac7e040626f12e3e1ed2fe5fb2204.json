@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO holder.device_keys (id, env_id, user_id, thumbprint, jwk)\n           VALUES ($1, $2, $3, $4, $5)\n           ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "49c915dee6108fba4b7f93fa5805fa97a7aac7e040626f12e3e1ed2fe5fb2204"
+}

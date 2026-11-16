@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO holder.presentations\n             (id, env_id, user_id, verifier_client_id, verifier_host,\n              disclosed_claims, formats)\n           VALUES ($1, $2, $3, $4, $5, $6, $7)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9e1f039967015ba706dfd9483c5fed144cbdf40a441032b3b89792c5e598e084"
+}

@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, format, doctype, vct, credential_ct\n                 FROM holder.credentials\n                WHERE user_id = $1 AND status = 'active'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "format",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "doctype",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "vct",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "credential_ct",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "5390e2ce775db73129da802ef65beaa5794fa89ec815dcc03793566f966c65a8"
+}

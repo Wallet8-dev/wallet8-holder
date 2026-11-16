@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE holder.credentials SET status = 'revoked'\n                   WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "21a06c78f2ea3affb491c82f55eb09ea885fe300939c4c581b13e3103e950b3e"
+}
