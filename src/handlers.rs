@@ -1050,6 +1050,33 @@ pub async fn issuance_prepare(
         .and_then(|c| c.get("scope"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // The client attestation (the HAIP client_attestation client-auth):
+    // the pair rides the PAR push headers when the holder carries the
+    // attester identity (DESIGN 4b; the campaign's HAIP variant).
+    let wallet_attestation = state
+        .wallet_attestation_slot
+        .read()
+        .await
+        .as_ref()
+        .map(|(attester, chain, issuer)| {
+            let audience = as_metadata
+                .token_endpoint
+                .rsplit_once('/')
+                .map(|(base, _)| base.to_string())
+                .unwrap_or_else(|| as_identifier.clone());
+            wallet8::oid4vci::mint_client_attestation(
+                attester,
+                chain,
+                issuer,
+                &state.wallet_client_id,
+                &device_key,
+                &audience,
+                None,
+                600,
+            )
+        })
+        .transpose()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let (_request_uri, oauth_state, pkce) = wallet8::oid4vci::push_authorization_request(
         &http,
         &par_endpoint,
@@ -1059,6 +1086,7 @@ pub async fn issuance_prepare(
         issuer_state.as_deref(),
         Some(&client_assertion),
         config_scope.as_deref(),
+        wallet_attestation.as_ref(),
     )
     .await
     .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
@@ -1178,9 +1206,32 @@ pub async fn issuance_complete(
     // nonce cache, and the use_dpop_nonce challenge-retry (RFC 9449
     // §5) - the AS's first 400 is the challenge, not a failure.
     let device_key = state.device_key(&user_id).await?;
-    let mut dpop = wallet8::oid4vci::DpopSession::new(device_key);
+    let mut dpop = wallet8::oid4vci::DpopSession::new(device_key.clone());
     // The session mints the RFC 7523 assertion PER ATTEMPT (a nonce
-    // retry must re-sign with a fresh jti - RFC 7523 4.3 replay).
+    // retry must re-sign with a fresh jti - RFC 7523 4.3 replay); the
+    // client-attestation minter (when the attester identity is
+    // present) rides each attempt as the two OAuth-Client-Attestation
+    // headers (fresh PoP jti per attempt too).
+    let attester_state = state.wallet_attestation_slot.read().await.clone();
+    let attestation_minter: Option<Box<dyn Fn() -> Result<wallet8::oid4vci::ClientAttestation, String> + Send + Sync>> =
+        match attester_state {
+            Some((attester, chain, issuer)) => {
+                let as_id = as_identifier.clone();
+                let client_id = state.wallet_client_id.clone();
+                let dk = device_key.clone();
+                let aud = as_metadata.token_endpoint.clone();
+                Some(Box::new(move || {
+                    let audience = aud
+                        .rsplit_once('/')
+                        .map(|(base, _)| base.to_string())
+                        .unwrap_or_else(|| as_id.clone());
+                    wallet8::oid4vci::mint_client_attestation(
+                        &attester, &chain, &issuer, &client_id, &dk, &audience, None, 600,
+                    )
+                }))
+            }
+            None => None,
+        };
     let token_response = dpop
         .exchange_code(
             &http,
@@ -1190,6 +1241,7 @@ pub async fn issuance_complete(
             &req.code,
             &pkce_verifier,
             Some(as_identifier.as_str()),
+            attestation_minter.as_deref(),
         )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
@@ -1387,6 +1439,94 @@ pub async fn issuance_complete(
         "vct": vct,
         "issuer": credential_issuer,
     })))
+}
+
+
+/// Standard-base64 no-pad form (the x5c encoding).
+fn b64url(b: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+/// The client-attestation identity registration (the HAIP
+/// client_attestation cells): the ATTESTER's PKCS#8 PEM + its x5c
+/// chain + the attestation issuer id. The campaign-only surface -
+/// the seed rotates the attester key per seed, so the identity flows
+/// through the campaign env and the runner registers it before the
+/// plans run (the same pattern the device-key registration uses).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct AttestationIdentityRequest {
+    /// The attester's PKCS#8 PEM private key (multi-line form).
+    #[serde(default)]
+    pub key_pem: Option<String>,
+    /// The attester's PKCS#8 DER as single-line STANDARD base64 (the
+    /// campaign env's newline-free form).
+    #[serde(default)]
+    pub key_der_b64: Option<String>,
+    /// The attester's x5c chain (base64 DER entries).
+    pub x5c: Vec<String>,
+    /// The attestation issuer id the attestation claims.
+    pub issuer: String,
+}
+
+/// `POST /v1/attestation-identity` - register the client-attestation
+/// identity (the attester key/chain/issuer). Idempotent: the last
+/// registration wins.
+#[utoipa::path(
+    post,
+    path = "/v1/attestation-identity",
+    request_body = AttestationIdentityRequest,
+    responses((status = 200, description = "the identity registered")),
+    tag = "holder",
+)]
+pub async fn register_attestation_identity(
+    State(state): State<AppState>,
+    Json(req): Json<AttestationIdentityRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use base64::Engine as _;
+    use p256::pkcs8::DecodePrivateKey;
+    let key = if let Some(pem) = req.key_pem.as_deref().filter(|p| !p.trim().is_empty()) {
+        p256::SecretKey::from_pkcs8_pem(pem)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("the attester key (pem): {e}")))?
+    } else if let Some(der_b64) = req.key_der_b64.as_deref().filter(|p| !p.trim().is_empty()) {
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(der_b64.trim())
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("the attester key (der): {e}")))?;
+        p256::SecretKey::from_pkcs8_der(&der)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("the attester key (der parse): {e}")))?
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "no attester key material (key_pem or key_der_b64)".into()));
+    };
+    let signing = p256::ecdsa::SigningKey::from(key);
+    // Self-check: the x5c LEAF must certify the PUBLIC half of the
+    // PEM key (a mismatched pair would produce attestations the suite
+    // rejects far from the cause).
+    if let Some(leaf_b64) = req.x5c.last() {
+        use base64::Engine as _;
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(leaf_b64.trim())
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("the leaf x5c: {e}")))?;
+        let (_, leaf) = x509_parser::parse_x509_certificate(&der)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("the leaf parse: {e}")))?;
+        let want = wallet8::oid4vci::device_key_jwk(&signing.verifying_key());
+        let spki = leaf.public_key().subject_public_key.data.to_vec();
+        // EC SPKI: 0x04 | X | Y (65 bytes for P-256) - the raw point.
+        if spki.len() == 65 {
+            let got = serde_json::json!({
+                "kty": "EC", "crv": "P-256",
+                "x": b64url(&spki[1..33]),
+                "y": b64url(&spki[33..65]),
+            });
+            if got != want {
+                return Err((StatusCode::BAD_REQUEST, "the attester PEM and its x5c leaf are a DIFFERENT keypair".into()));
+            }
+        }
+    }
+    {
+        let mut slot = state.wallet_attestation_slot.write().await;
+        *slot = Some((signing, req.x5c.clone(), req.issuer.clone()));
+    }
+    
+    Ok(Json(serde_json::json!({"status": "registered"})))
 }
 
 /// The deferred-poll request (§9).

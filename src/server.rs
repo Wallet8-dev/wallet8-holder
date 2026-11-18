@@ -30,6 +30,20 @@ pub struct AppState {
     /// value; the conformance campaign overrides the default via
     /// WALLET8_HOLDER_REDIRECT_URI).
     pub wallet_redirect_uri: String,
+    /// The client-attestation identity (the HAIP client_attestation
+    /// client-auth variant): the attester's signing key + its x5c
+    /// chain + the attestation issuer id. None = the plain form (the
+    /// attestation headers stay off the PAR/token calls). Runtime-
+    /// registered per campaign (POST /v1/attestation-identity - the
+    /// seed rotates the attester key per seed); the env form is the
+    /// boot default.
+    pub wallet_attestation:
+        Option<(p256::ecdsa::SigningKey, Vec<String>, String)>,
+    /// The runtime attestation slot (the campaign's identity
+    /// registration writes it; the handlers read it through this
+    /// shared reference).
+    pub wallet_attestation_slot:
+        std::sync::Arc<tokio::sync::RwLock<Option<(p256::ecdsa::SigningKey, Vec<String>, String)>>>,
     /// The Valkey URL (the presentation-session store).
     pub valkey_url: String,    /// The verifier trust surface (§5.9/§12): the trusted
     /// verifier-attestation issuers - the ecosystem anchor list
@@ -278,7 +292,31 @@ pub async fn build_state(
         .unwrap_or_else(|_| "wallet8-web".to_string());
     let wallet_redirect_uri = std::env::var("WALLET8_HOLDER_REDIRECT_URI")
         .unwrap_or_else(|_| "https://wallet8.local/cb".to_string());
+    // The client-attestation identity (HAIP client_attestation): the
+    // ATTESTER trust-domain key + x5c chain (+ the issuer id the
+    // attestation claims). WALLET8_HOLDER_ATTESTATION_KEY_PEM +
+    // WALLET8_HOLDER_ATTESTATION_X5C + WALLET8_HOLDER_ATTESTATION_ISSUER.
+    let attestation_key_pem = std::env::var("WALLET8_HOLDER_ATTESTATION_KEY_PEM")
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    let attestation_x5c = std::env::var("WALLET8_HOLDER_ATTESTATION_X5C")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let attestation_issuer = std::env::var("WALLET8_HOLDER_ATTESTATION_ISSUER")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let valkey_url = core.config.valkey_url.clone();
+    let wallet_attestation = match (attestation_key_pem, attestation_x5c, attestation_issuer) {
+        (Some(pem), Some(x5c), Some(iss)) => {
+            use p256::pkcs8::DecodePrivateKey;
+            let key = p256::SecretKey::from_pkcs8_pem(&pem)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("the attestation key: {e}")))?;
+            let chain: Vec<String> = serde_json::from_str::<Vec<String>>(&x5c)
+                .unwrap_or_else(|_| x5c.split(',').map(str::to_string).collect());
+            Some((p256::ecdsa::SigningKey::from(key), chain, iss))
+        }
+        _ => None,
+    };
     // The verifier-attestation issuers (§12's trust anchor - the
     // ecosystem's deployment data): WALLET8_HOLDER_ATTESTATION_ISSUERS
     // = a JSON array of {"iss": ..., "jwk": {...}} entries.
@@ -313,6 +351,8 @@ pub async fn build_state(
         data_key_seed,
         wallet_client_id,
         wallet_redirect_uri,
+        wallet_attestation_slot: std::sync::Arc::new(tokio::sync::RwLock::new(wallet_attestation.clone())),
+        wallet_attestation,
         valkey_url,
         verifier_trust,
         scope_registry,
@@ -366,5 +406,12 @@ pub fn routes(router: axum::Router<AppState>, _state: AppState) -> axum::Router<
         .route(
             "/v1/credentials/sync",
             post(crate::handlers::credentials_sync),
+        )
+        // The client-attestation identity registration (the campaign
+        // HAIP cells - the seed rotates the attester key per seed and
+        // the runner registers it before the plans run).
+        .route(
+            "/v1/attestation-identity",
+            post(crate::handlers::register_attestation_identity),
         )
 }

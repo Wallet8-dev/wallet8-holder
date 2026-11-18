@@ -25,6 +25,8 @@ wallet8 = { git = "https://github.com/Wallet8-dev/wallet8-sdk", tag = "wallet8-v
 
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+# The attester self-check: the x5c leaf parse (SPKI extraction).
+x509-parser = "0.16"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["trace", "cors", "compression-gzip", "limit"] }
 serde = { version = "1", features = ["derive"] }
