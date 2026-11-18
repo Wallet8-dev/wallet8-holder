@@ -495,13 +495,13 @@ pub async fn issuance_intake(
     // §8.3/§11: the immediate form carries the optional
     // notification_id; the deferred form parks it (below).
     let (minted, notification_id) = match response {
-        wallet8::oid4vci::CredentialResponse::Issued(creds) => (
-            creds
+        wallet8::oid4vci::CredentialResponse::Issued { credentials, notification_id } => {
+            let minted = credentials
                 .first()
                 .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (8.3)".into()))?
-                .clone(),
-            None::<String>,
-        ),
+                .clone();
+            (minted, notification_id)
+        }
         // §9: the deferred form parks the transaction - the app
         // polls /v1/issuance/deferred after `interval`.
         wallet8::oid4vci::CredentialResponse::Deferred { transaction_id, interval, notification_id } => {
@@ -555,7 +555,15 @@ pub async fn issuance_intake(
     sqlx::query!(
         r#"INSERT INTO holder.credentials
              (id, env_id, user_id, format, doctype, vct, display_name, issuer, credential_ct)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (env_id, user_id) DO UPDATE
+             SET format = EXCLUDED.format,
+                 doctype = EXCLUDED.doctype,
+                 vct = EXCLUDED.vct,
+                 display_name = EXCLUDED.display_name,
+                 issuer = EXCLUDED.issuer,
+                 credential_ct = EXCLUDED.credential_ct,
+                 issued_at = now()"#,
         row_id,
         state.env_id,
         user_id,
@@ -576,15 +584,17 @@ pub async fn issuance_intake(
     if let (Some(endpoint), Some(notification_id)) =
         (metadata.notification_endpoint.as_deref(), notification_id.as_deref())
     {
-        let _ = wallet8::oid4vci::send_notification(
-            &http,
-            endpoint,
-            &access_token,
-            notification_id,
-            wallet8::oid4vci::NotificationEvent::CredentialAccepted,
-            None,
-        )
-        .await;
+        // The §11 notification through the DPoP session (the resource
+        // endpoint's own nonce challenge applies, DESIGN 4b).
+        let device_key = state.device_key(&user_id).await?;
+        let mut dpop = wallet8::oid4vci::DpopSession::new(device_key);
+        let notify_body = serde_json::json!({
+            "notification_id": notification_id,
+            "event": wallet8::oid4vci::NotificationEvent::CredentialAccepted.code(),
+        });
+        let _ = dpop
+            .post_protected_notify(&http, endpoint, &access_token, &notify_body)
+            .await;
     }
     Ok(Json(serde_json::json!({
         "id": row_id,
@@ -682,7 +692,7 @@ pub async fn presentation_resolve(
         .collect();
     // The resolved request rides the session alias (the present step
     // re-reads it; the app never re-fetches the verifier).
-    let session_key = format!("vp:req:{}", uuid::Uuid::new_v4());
+    let session_key = format!("holder:vp:req:{}", uuid::Uuid::new_v4());
     {
         use glide::AsyncCommands as _;
         let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
@@ -758,7 +768,12 @@ pub async fn presentation_deliver(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let payload: Option<String> = conn
-        .get(format!("vp:req:{}", req.session.trim_start_matches("vp:req:")))
+        // The same full-key-form session rule (the oid4vp parking).
+        .get(if req.session.starts_with("holder:") {
+            req.session.clone()
+        } else {
+            format!("holder:vp:req:{}", req.session.trim_start_matches("vp:req:"))
+        })
         .await
         .ok()
         .flatten();
@@ -909,6 +924,15 @@ pub async fn presentation_deliver(
 pub struct PrepareRequest {
     /// The scanned offer URL.
     pub offer_url: String,
+    /// The issuer-metadata URL override (the conformance campaign's
+    /// RFC8414 form - the suite hosts `{base}/.well-known/...` where base
+    /// carries the instance path; the §12.2.2 OIDC-suffix derivation is
+    /// rejected by the suite's path-form check).
+    #[serde(default)]
+    pub issuer_metadata_url: Option<String>,
+    /// The AS-metadata URL override (the same campaign rule - RFC 8414).
+    #[serde(default)]
+    pub as_metadata_url: Option<String>,
 }
 
 /// The complete request (the browser callback -> the credential).
@@ -959,10 +983,14 @@ pub async fn issuance_prepare(
     };
     let offer = wallet8::oid4vci::parse_credential_offer(&offer_body)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    // (2) The metadata (12.2.2) + the offered configuration.
-    let metadata = wallet8::oid4vci::resolve_issuer_metadata(&http, &offer.credential_issuer)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    // (2) The metadata (12.2.2) + the offered configuration. The
+    // campaign override fetches the EXPLICIT metadata URL (the mock
+    // issuer's RFC8414 path form).
+    let metadata = match &req.issuer_metadata_url {
+        Some(url) => wallet8::oid4vci::fetch_issuer_metadata(&http, url, &offer.credential_issuer).await,
+        None => wallet8::oid4vci::resolve_issuer_metadata(&http, &offer.credential_issuer).await,
+    }
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     let config_id = offer
         .credential_configuration_ids
         .first()
@@ -978,9 +1006,11 @@ pub async fn issuance_prepare(
     });
     let as_identifier = wallet8::oid4vci::select_authorization_server(&metadata, hint.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let as_metadata = wallet8::oid4vci::resolve_as_metadata(&http, &as_identifier)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let as_metadata = match &req.as_metadata_url {
+        Some(url) => wallet8::oid4vci::fetch_as_metadata(&http, url).await,
+        None => wallet8::oid4vci::resolve_as_metadata(&http, &as_identifier).await,
+    }
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     let par_endpoint = as_metadata
         .pushed_authorization_request_endpoint
         .clone()
@@ -1000,18 +1030,43 @@ pub async fn issuance_prepare(
         }
         _ => None,
     });
+    // The RFC 7523 private_key_jwt client assertion (the mock issuer's
+    // PAR endpoint validates the client auth; the plan's
+    // client_auth_type=private_key_jwt posture).
+    let device_key = state.device_key(&user_id).await?;
+    let client_assertion = wallet8::oid4vci::mint_client_assertion(
+        &device_key,
+        &state.wallet_client_id,
+        &as_identifier,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // The PAR scope (§5.1.2): the offered configuration's scope when
+    // the metadata declares one (the conformance mock's
+    // `eudi.pid.1`), else none (the suite rejects `openid` under
+    // this plan's PLAIN_OAUTH variant).
+    let config_scope = metadata
+        .credential_configurations_supported
+        .get(&config_id)
+        .and_then(|c| c.get("scope"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let (_request_uri, oauth_state, pkce) = wallet8::oid4vci::push_authorization_request(
         &http,
         &par_endpoint,
         &state.wallet_client_id,
-        &format!("https://wallet8.local/cb"),
+        &state.wallet_redirect_uri,
         &details,
         issuer_state.as_deref(),
+        Some(&client_assertion),
+        config_scope.as_deref(),
     )
     .await
     .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     // (4) The session parks (600s - the PAR expiry window).
-    let session = format!("vci:prepare:{}", uuid::Uuid::new_v4());
+    // The key rides the workload ACL namespace (`~holder:*`, the
+    // sentin8 valkey ACL policy for `m2m-wallet8:holder`) - `vci:*`
+    // is writable by no workload.
+    let session = format!("holder:vci:prepare:{}", uuid::Uuid::new_v4());
     {
         use glide::AsyncCommands as _;
         let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
@@ -1023,10 +1078,10 @@ pub async fn issuance_prepare(
             "credential_issuer": offer.credential_issuer,
             "config_id": config_id,
             "as_metadata": as_metadata,
+            "as_identifier": as_identifier,
             "metadata": metadata,
             "pkce_verifier": pkce.verifier,
             "oauth_state": oauth_state,
-            "credential_issuer": offer.credential_issuer,
         });
         let _: Result<(), _> = conn
             .set_ex(&session, parked.to_string(), 600u64)
@@ -1066,7 +1121,14 @@ pub async fn issuance_complete(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let parked_raw: Option<String> = conn
-        .get(format!("vci:prepare:{}", req.session.trim_start_matches("vci:prepare:")))
+        // The session id travels in full-key form
+        // (`holder:vci:prepare:<uuid>`) - read exactly that key; only a
+        // legacy bare-uuid id gets the template reapplied.
+        .get(if req.session.starts_with("holder:") {
+            req.session.clone()
+        } else {
+            format!("holder:vci:prepare:{}", req.session.trim_start_matches("vci:prepare:"))
+        })
         .await
         .ok()
         .flatten();
@@ -1098,23 +1160,39 @@ pub async fn issuance_complete(
     let as_metadata: wallet8::oid4vci::AsMetadata =
         serde_json::from_value(parked.get("as_metadata").cloned().unwrap_or_default())
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the session AS: {e}")))?;
+    let as_identifier = parked
+        .get("as_identifier")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let pkce_verifier = parked
         .get("pkce_verifier")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
     let http = state.http_client();
-    // (1) The token exchange (6.1: the code + PKCE + the redirect).
-    let token_response = wallet8::oid4vci::exchange_code(
-        &http,
-        &as_metadata.token_endpoint,
-        &state.wallet_client_id,
-        "https://wallet8.local/cb",
-        &req.code,
-        &pkce_verifier,
-    )
-    .await
-    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    // (1) The token exchange (6.1: the code + PKCE + the redirect +
+    // the private_key_jwt client assertion) bound with the DPoP
+    // session (DESIGN 4b): one device key for the token + every
+    // resource proof (the AS's cnf.jkt binding), the per-endpoint
+    // nonce cache, and the use_dpop_nonce challenge-retry (RFC 9449
+    // §5) - the AS's first 400 is the challenge, not a failure.
+    let device_key = state.device_key(&user_id).await?;
+    let mut dpop = wallet8::oid4vci::DpopSession::new(device_key);
+    // The session mints the RFC 7523 assertion PER ATTEMPT (a nonce
+    // retry must re-sign with a fresh jti - RFC 7523 4.3 replay).
+    let token_response = dpop
+        .exchange_code(
+            &http,
+            &as_metadata.token_endpoint,
+            &state.wallet_client_id,
+            &state.wallet_redirect_uri,
+            &req.code,
+            &pkce_verifier,
+            Some(as_identifier.as_str()),
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     let access_token = token_response
         .get("access_token")
         .and_then(|t| t.as_str())
@@ -1130,8 +1208,9 @@ pub async fn issuance_complete(
         None => wallet8::oid4vci::CredentialRequestTarget::ConfigurationId(config_id.clone()),
     };
     // (3) The nonce pre-flight (7.1) + the proof (F.1) + the
-    // credential request (8.2).
-    let device_key = state.device_key(&user_id).await?;
+    // credential request (8.2) - the DPoP session wraps the
+    // protected call (the resource endpoint's own nonce challenge,
+    // DESIGN 4b).
     let c_nonce = match &metadata.nonce_endpoint {
         Some(endpoint) => Some(
             wallet8::oid4vci::fetch_nonce(&http, endpoint)
@@ -1141,24 +1220,66 @@ pub async fn issuance_complete(
         None => None,
     };
     let proof = wallet8::oid4vci::mint_jwt_proof(
-        &device_key,
+        dpop.proof_key(),
         Some(state.wallet_client_id.as_str()),
         &credential_issuer,
         c_nonce.as_deref(),
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let response = wallet8::oid4vci::request_credential(
-        &http,
-        &metadata.credential_endpoint,
-        &access_token,
-        &wallet8::oid4vci::CredentialRequestBody {
-            target,
-            proofs: serde_json::json!({ "jwt": [proof] }),
-            credential_response_encryption: None,
-        },
-    )
-    .await
-    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    // The batch behavior (OID4VCI 3.3.2): an advertised
+    // batch_credential_issuance (batch_size >= 2) lets the wallet send
+    // MULTIPLE independent proofs (each minted fresh over the device
+    // key + c_nonce) - the response returns one credential PER proof,
+    // possibly reordered. The holder sends a two-proof batch when the
+    // advert allows it (the vault stores the credential bound to the
+    // FIRST proof's key; both proofs sign over the same device key +
+    // c_nonce so either holds).
+    let advertised_batch = metadata
+        .batch_credential_issuance
+        .as_ref()
+        .and_then(|b| b.get("batch_size"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let proofs = if advertised_batch >= 2 {
+        // VCIEnsureProofKeysAreDistinct: each proof in a batch binds
+        // to a FRESH key (unlinkability - verifiers must not be able
+        // to link the batch's credentials to one another). The
+        // ephemeral key mints its proof with the same c_nonce +
+        // audience; the main device-key proof stays first (the vault
+        // stores the credential bound to the device key so the
+        // presentation path keeps working).
+        let ephemeral = p256::SecretKey::random(
+            &mut p256::elliptic_curve::rand_core::OsRng,
+        );
+        let ephemeral_key = p256::ecdsa::SigningKey::from(&ephemeral);
+        let proof2 = wallet8::oid4vci::mint_jwt_proof(
+            &ephemeral_key,
+            Some(state.wallet_client_id.as_str()),
+            &credential_issuer,
+            c_nonce.as_deref(),
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        serde_json::json!({ "jwt": [proof, proof2] })
+    } else {
+        serde_json::json!({ "jwt": [proof] })
+    };
+    let request_body = wallet8::oid4vci::CredentialRequestBody {
+        target,
+        proofs,
+        credential_response_encryption: None,
+    };
+    let response_value = dpop
+        .post_protected_json(
+            &http,
+            &metadata.credential_endpoint,
+            &access_token,
+            &serde_json::to_value(&request_body)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let response = wallet8::oid4vci::parse_credential_response(&response_value)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     // (4) The store (8.3) + the notification (11).
     let configuration = metadata
         .credential_configurations_supported
@@ -1166,14 +1287,14 @@ pub async fn issuance_complete(
         .cloned()
         .unwrap_or_default();
     let (minted, notification_id) = match response {
-        wallet8::oid4vci::CredentialResponse::Issued(creds) => (
-            creds
+        wallet8::oid4vci::CredentialResponse::Issued { credentials, notification_id } => {
+            let minted = credentials
                 .first()
                 .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (8.3)".into()))?
                 .credential
-                .clone(),
-            None::<String>,
-        ),
+                .clone();
+            (minted, notification_id)
+        }
         wallet8::oid4vci::CredentialResponse::Deferred { transaction_id, interval, notification_id } => {
             let deferred_session = format!("vci:deferred:{transaction_id}");
             let deferred_parked = serde_json::json!({
@@ -1216,10 +1337,21 @@ pub async fn issuance_complete(
         .bind(state.env_id)
         .execute(&mut *tx)
         .await;
+    // The vault invariant: ONE holding per (env, user) per the unique
+    // index - a renewed issuance REPLACES the holding (the wallet's
+    // credential slot, DESIGN 3).
     sqlx::query!(
         r#"INSERT INTO holder.credentials
              (id, env_id, user_id, format, doctype, vct, display_name, issuer, credential_ct)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (env_id, user_id) DO UPDATE
+             SET format = EXCLUDED.format,
+                 doctype = EXCLUDED.doctype,
+                 vct = EXCLUDED.vct,
+                 display_name = EXCLUDED.display_name,
+                 issuer = EXCLUDED.issuer,
+                 credential_ct = EXCLUDED.credential_ct,
+                 issued_at = now()"#,
         row_id,
         state.env_id,
         user_id,
@@ -1237,15 +1369,15 @@ pub async fn issuance_complete(
     if let (Some(endpoint), Some(notification_id)) =
         (metadata.notification_endpoint.as_deref(), notification_id.as_deref())
     {
-        let _ = wallet8::oid4vci::send_notification(
-            &http,
-            endpoint,
-            &access_token,
-            notification_id,
-            wallet8::oid4vci::NotificationEvent::CredentialAccepted,
-            None,
-        )
-        .await;
+        // The notification (§11) rides the same DPoP session - the
+        // resource endpoint's own nonce challenge applies (DESIGN 4b).
+        let notify_body = serde_json::json!({
+            "notification_id": notification_id,
+            "event": wallet8::oid4vci::NotificationEvent::CredentialAccepted.code(),
+        });
+        let _ = dpop
+            .post_protected_notify(&http, endpoint, &access_token, &notify_body)
+            .await;
     }
     Ok(Json(serde_json::json!({
         "id": row_id,
@@ -1262,6 +1394,35 @@ pub async fn issuance_complete(
 pub struct DeferredRequest {
     /// The deferred transaction id.
     pub transaction_id: String,
+}
+
+/// Decode a Deferred Credential Response (§9.2) - the holder-side
+/// form of the SDK's DeferredAnswer (the DpopSession-protected poll
+/// returns the raw value).
+fn parse_deferred_answer(
+    v: &serde_json::Value,
+) -> Result<wallet8::oid4vci::DeferredAnswer, String> {
+    if let Some(creds) = v.get("credentials").and_then(|c| c.as_array()) {
+        let mut out = Vec::new();
+        for entry in creds {
+            out.push(wallet8::oid4vci::MintedCredential {
+                credential: entry
+                    .get("credential")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+        return Ok(wallet8::oid4vci::DeferredAnswer::Issued(out));
+    }
+    if let Some(tx) = v.get("transaction_id").and_then(|t| t.as_str()) {
+        let interval = v.get("interval").and_then(|i| i.as_u64()).unwrap_or(0);
+        return Ok(wallet8::oid4vci::DeferredAnswer::Pending {
+            transaction_id: tx.to_string(),
+            interval,
+        });
+    }
+    Err("the deferred response carries neither credentials nor transaction_id (§9.2)".into())
 }
 
 /// `POST /v1/issuance/deferred` - the §9 poll: the parked
@@ -1311,9 +1472,17 @@ pub async fn issuance_deferred(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    // The poll (9.1: the transaction_id + the same access token).
-    let answer = wallet8::oid4vci::poll_deferred(&http, deferred_endpoint, &access_token, &req.transaction_id)
+    // The poll (9.1: the transaction_id + the same access token) - the
+    // DPoP session wraps the deferred call (a resource endpoint; its own
+    // nonce challenge applies, DESIGN 4b).
+    let device_key = state.device_key(&user_id).await?;
+    let mut dpop = wallet8::oid4vci::DpopSession::new(device_key);
+    let poll_body = serde_json::json!({ "transaction_id": req.transaction_id });
+    let answer_value = dpop
+        .post_protected_json(&http, deferred_endpoint, &access_token, &poll_body)
         .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let answer = parse_deferred_answer(&answer_value)
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     match answer {
         wallet8::oid4vci::DeferredAnswer::Pending { transaction_id, interval } => Ok(Json(
@@ -1344,7 +1513,15 @@ pub async fn issuance_deferred(
             sqlx::query!(
                 r#"INSERT INTO holder.credentials
                      (id, env_id, user_id, format, doctype, vct, display_name, issuer, credential_ct)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                   ON CONFLICT (env_id, user_id) DO UPDATE
+                     SET format = EXCLUDED.format,
+                         doctype = EXCLUDED.doctype,
+                         vct = EXCLUDED.vct,
+                         display_name = EXCLUDED.display_name,
+                         issuer = EXCLUDED.issuer,
+                         credential_ct = EXCLUDED.credential_ct,
+                         issued_at = now()"#,
                 row_id,
                 state.env_id,
                 user_id,
@@ -1360,20 +1537,19 @@ pub async fn issuance_deferred(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             let _ = tx.commit().await;
             // The terminal notification (11) when the deferred flow
-            // carried one.
+            // carried one - through the same DPoP session (DESIGN 4b:
+            // the resource endpoint's own nonce challenge applies).
             if let (Some(endpoint), Some(notification_id)) = (
                 parked.get("notification_endpoint").and_then(|v| v.as_str()),
                 parked.get("notification_id").and_then(|v| v.as_str()),
             ) {
-                let _ = wallet8::oid4vci::send_notification(
-                    &http,
-                    endpoint,
-                    &access_token,
-                    notification_id,
-                    wallet8::oid4vci::NotificationEvent::CredentialAccepted,
-                    None,
-                )
-                .await;
+                let notify_body = serde_json::json!({
+                    "notification_id": notification_id,
+                    "event": wallet8::oid4vci::NotificationEvent::CredentialAccepted.code(),
+                });
+                let _ = dpop
+                    .post_protected_notify(&http, endpoint, &access_token, &notify_body)
+                    .await;
             }
             // The transaction is consumed (9.1: the issuer
             // invalidates it).

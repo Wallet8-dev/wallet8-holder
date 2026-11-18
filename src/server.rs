@@ -25,6 +25,11 @@ pub struct AppState {
     pub data_key_seed: Vec<u8>,
     /// The wallet's OAuth client id (the authorize rounds).
     pub wallet_client_id: String,
+    /// The wallet's registered OAuth redirect_uri (§3.1.2.3 - the
+    /// PAR push + the token exchange MUST present the registered
+    /// value; the conformance campaign overrides the default via
+    /// WALLET8_HOLDER_REDIRECT_URI).
+    pub wallet_redirect_uri: String,
     /// The Valkey URL (the presentation-session store).
     pub valkey_url: String,    /// The verifier trust surface (§5.9/§12): the trusted
     /// verifier-attestation issuers - the ecosystem anchor list
@@ -271,6 +276,8 @@ pub async fn build_state(
         .expect("the derived dev key is a valid master key");
     let wallet_client_id = std::env::var("WALLET8_HOLDER_CLIENT_ID")
         .unwrap_or_else(|_| "wallet8-web".to_string());
+    let wallet_redirect_uri = std::env::var("WALLET8_HOLDER_REDIRECT_URI")
+        .unwrap_or_else(|_| "https://wallet8.local/cb".to_string());
     let valkey_url = core.config.valkey_url.clone();
     // The verifier-attestation issuers (§12's trust anchor - the
     // ecosystem's deployment data): WALLET8_HOLDER_ATTESTATION_ISSUERS
@@ -305,6 +312,7 @@ pub async fn build_state(
         data_key,
         data_key_seed,
         wallet_client_id,
+        wallet_redirect_uri,
         valkey_url,
         verifier_trust,
         scope_registry,

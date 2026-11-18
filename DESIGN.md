@@ -34,6 +34,12 @@ the AES-256-GCM envelope (`sentin8::crypto::seal_str`); the key
 derives from the `WALLET8_HOLDER_DATA_KEY` service secret. Every
 query is schema-qualified (no search_path dependence).
 
+The vault invariant: `credentials_env_user_idx` - ONE holding per
+(env, user). Every vault write (the intake, the complete flow, the
+deferred poll) upserts on that key: a renewed issuance REPLACES the
+holding in place (`issued_at = now()`), never errors on duplicate -
+the wallet's credential is a SLOT, not an append-only log.
+
 ## 3a. Spec-first implementation (the governing directive)
 
 The wallet8 SDK clients are implementations of the normative
@@ -68,6 +74,94 @@ finding is re-examined against the text.
 
 See the vertical DESIGN.md §4. Every handler: the RLS context set +
 the query on ONE transaction.
+
+## 4a. The conformance-certification orchestration (WALCERT-1)
+
+The OIDF wallet campaign (`oid4vci-1_0-wallet-test-plan`) certifies
+THIS service as the system-under-test: the suite plays the MOCK
+credential issuer and this holder's SDK consumes the offer and runs
+the issuance flow. The orchestration the rig drives:
+
+1. The runner (on the module's WAITING state, once per unserved
+   parking marker) POSTs `POST /v1/issuance/prepare {offer_url}` - the
+   suite-hosted offer document URL. The intake parses the offer, the
+   RFC8414 metadata, pushes the PAR with the authorization_details,
+   parks the session (600s), and returns `{session, authorize_url}`.
+2. The runner completes the authorize journey (the suite's mock issuer
+   serves the authorize endpoint; its browser block or a direct GET
+   with the mocked-consent posture delivers the code to the registered
+   redirect).
+3. The runner POSTs `POST /v1/issuance/complete {session, code, state}`
+   - the state check, the PKCE token exchange, the nonce pre-flight,
+   the jwt proof, the credential request, the vault store, and the
+   notification.
+
+The holder's client identity for the campaign:
+`WALLET8_HOLDER_CLIENT_ID` + `WALLET8_HOLDER_CLIENT_JWKS` (the
+published EC keys; the plan config's `client.jwks` mirrors them
+public-only per the EnsureJwksHasNoPrivateOrSymmetricKeyMaterial
+check). The identity rides the plan config's client block - the same
+registration the suite validates.
+
+## 4b. DPoP access-token sender-constraining (RFC 9449)
+
+When the AS metadata/advertisement constrains access tokens with DPoP
+(the campaign's `dpop` variant; any AS advertising
+`dpop_signing_alg_values_supported`), every HTTP call the wallet's
+issuance client makes - the token exchange and EVERY
+access-token-bearing call after it (credential, deferred, notification)
+- carries a DPoP proof JWT (RFC 9449 4.2), and every DPoP-capable
+endpoint is exercised against the nonce-challenge posture:
+
+```mermaid
+sequenceDiagram
+    participant W as wallet8-holder (wallet)
+    participant AS as Authorization Server
+    participant RS as Credential/Deferred/Notification (resource)
+    W->>AS: POST token (form: code/verifier/redirect/...) + DPoP proof (htm/htu flat, typ dpop+jwt, iat, jti, jwk)
+    AS-->>W: 400 use_dpop_nonce + DPoP-Nonce header (RFC 9449 5 - first call challenges)
+    W->>AS: POST token again + NEW DPoP proof (same key, fresh iat/jti, claims.nonce = challenge)
+    AS-->>W: 200 {access_token (cnf.jkt = the proof key thumbprint)}
+    W->>RS: POST credential (Authorization: Bearer) + DPoP proof (ath = b64(sha256(access_token)))
+    RS-->>W: 400 use_dpop_nonce + DPoP-Nonce (the resource endpoint's own nonce)
+    W->>RS: POST credential + fresh proof (nonce = resource challenge, ath)
+    RS-->>W: 200 credentials / 202 deferred
+```
+
+Invariants (all verified by the suite's conditions
+`ValidateDpopProof*`/`EnsureDpopProofJtiNotAlreadyUsed`/
+`ValidateDpopAccessTokenJkt`/`ValidateDpopProofAccessTokenHash`):
+
+- ONE key. The token-call proof and every resource-call proof sign with
+  the SAME wallet device key - the AS binds the access token to that
+  key's thumbprint (`cnf.jkt`) and the resource endpoints validate
+  the proof `jwk` against it.
+- Proof shape. Header `typ: dpop+jwt`, `alg` (ES256), public `jwk`
+  (no private material). Claims: flat `htm` + `htu` (the FULL
+  request URL - no method/host/scheme object), `iat` (+ `exp`),
+  fresh `jti` per attempt, `nonce` when challenged, and `ath` ONLY
+  when the call presents the access token (token call: NEVER `ath`).
+- Nonce handling. `400 use_dpop_nonce` + `DPoP-Nonce` response header
+  is a CHALLENGE, not a failure: the wallet reads the header, caches
+  the endpoint-scoped nonce, and retries ONCE with a fresh proof
+  carrying it (RFC 9449 8.2: the retry MUST be accepted when the
+  nonce matches - a second challenge is a defect). Token, credential,
+  deferred, and notification each keep THEIR OWN cached nonce (the
+  AS and the resource servers mint independent nonces; the
+  suite's `token_endpoint_dpop_nonce_error` /
+  `resource_endpoint_dpop_nonce_error` environments are separate).
+- The `DPoP` header name is case-normalized by transports; the value
+  is the compact JWS. The `authorization` header stays `Bearer` for
+  this flow (the mTLS-bound form is a different variant).
+
+Implementation: the SDK owns the mechanics -
+`mint_dpop_proof` (the flat RFC 9449 claims), `DpopSession` (the
+per-endpoint nonce cache + the challenge-retry wrappers
+`exchange_code_dpop` / `post_protected_dpop`), and
+`dpop_nonce_from_response` (the `DPoP-Nonce` header read). The
+holder orchestrates: it mints NO proofs itself; it passes the
+device key + the endpoint URLs and the SDK performs the
+challenge-retry round transparently.
 
 ## 5. Cross-Cutting Concerns
 

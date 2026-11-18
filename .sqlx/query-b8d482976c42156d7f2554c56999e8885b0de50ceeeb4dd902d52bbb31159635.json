@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO holder.credentials\n                     (id, env_id, user_id, format, doctype, vct, display_name, issuer, credential_ct)\n                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n                   ON CONFLICT (env_id, user_id) DO UPDATE\n                     SET format = EXCLUDED.format,\n                         doctype = EXCLUDED.doctype,\n                         vct = EXCLUDED.vct,\n                         display_name = EXCLUDED.display_name,\n                         issuer = EXCLUDED.issuer,\n                         credential_ct = EXCLUDED.credential_ct,\n                         issued_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b8d482976c42156d7f2554c56999e8885b0de50ceeeb4dd902d52bbb31159635"
+}

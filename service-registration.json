@@ -8,5 +8,9 @@
         "name": "Wallet8:Holder Telemetry"
       }
     }
-  ]
+  ],
+  "extra_env": {
+    "WALLET8_HOLDER_CLIENT_ID": "wallet8-holder",
+    "WALLET8_HOLDER_REDIRECT_URI": "https://localhost.emobix.co.uk:8443/test/a/sentin8-wallet/callback"
+  }
 }
