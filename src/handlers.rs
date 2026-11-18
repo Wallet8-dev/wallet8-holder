@@ -1059,18 +1059,16 @@ pub async fn issuance_prepare(
         .await
         .as_ref()
         .map(|(attester, chain, issuer)| {
-            let audience = as_metadata
-                .token_endpoint
-                .rsplit_once('/')
-                .map(|(base, _)| base.to_string())
-                .unwrap_or_else(|| as_identifier.clone());
             wallet8::oid4vci::mint_client_attestation(
                 attester,
                 chain,
                 issuer,
                 &state.wallet_client_id,
                 &device_key,
-                &audience,
+                // The PoP aud = the AS identifier itself (the suite
+                // validates against the exact issuer string, trailing
+                // slash included - HAIP-4.4.1).
+                &as_identifier,
                 None,
                 600,
             )
@@ -1219,14 +1217,13 @@ pub async fn issuance_complete(
                 let as_id = as_identifier.clone();
                 let client_id = state.wallet_client_id.clone();
                 let dk = device_key.clone();
-                let aud = as_metadata.token_endpoint.clone();
                 Some(Box::new(move || {
-                    let audience = aud
-                        .rsplit_once('/')
-                        .map(|(base, _)| base.to_string())
-                        .unwrap_or_else(|| as_id.clone());
                     wallet8::oid4vci::mint_client_attestation(
-                        &attester, &chain, &issuer, &client_id, &dk, &audience, None, 600,
+                        // The PoP aud = the AS identifier itself (the
+                        // exact issuer string, trailing slash included
+                        // - the suite validates against the AS issuer,
+                        // HAIP-4.4.1).
+                        &attester, &chain, &issuer, &client_id, &dk, &as_id, None, 600,
                     )
                 }))
             }
