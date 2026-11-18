@@ -1,3 +1,7 @@
+-- SPDX-FileCopyrightText: Copyright Logically Magic Inc. <hello@logicallymagic.com>
+-- SPDX-FileCopyrightText: Copyright Hamid Jahanzad <Hamid@Jahanzad.com>
+-- SPDX-FileCopyrightText: Copyright Contributors to the Wallet8:Holder
+-- SPDX-License-Identifier: Apache-2.0
 -- Wallet8 Holder - the credential vault schema (DESIGN.md §3).
 --
 -- RLS is mandatory on every tenant table (architecture-principles §4.3):
