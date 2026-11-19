@@ -1432,30 +1432,48 @@ pub async fn issuance_complete(
         .and_then(|k| k.as_array())
         .and_then(|arr| arr.first())
         .cloned();
-    let req_body_value = match (&req_jwk, &response_encryption) {
-        // Seal only when the issuer's key is an EC P-256 key (the
-        // ECDH-ES family the wallet implements).
+    // Seal only when the issuer's key is an EC P-256 key (the
+    // ECDH-ES family the wallet implements); the sealed form rides as
+    // the RAW compact JWE body (Content-Type: application/jwe) - the
+    // suite rejects a JSON-STRING-wrapped JWE.
+    let sealed_jwe = match (&req_jwk, &response_encryption) {
         (Some(jwk), Some(_)) if jwk.get("kty").and_then(|v| v.as_str()) == Some("EC") => {
             let kid = jwk.get("kid").and_then(|v| v.as_str());
-            let jwe = wallet8::oid4vci::encrypt_request_ecdh_es_a256gcm(
-                &body_value,
-                jwk,
-                kid,
+            Some(
+                wallet8::oid4vci::encrypt_request_ecdh_es_a256gcm(
+                    &body_value,
+                    jwk,
+                    kid,
+                )
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the request seal: {e}")))?,
             )
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the request seal: {e}")))?;
-            serde_json::Value::String(jwe)
         }
-        _ => body_value,
+        _ => None,
     };
-    let response_text = dpop
-        .post_protected_text(
-            &http,
-            &metadata.credential_endpoint,
-            &access_token,
-            &req_body_value,
-        )
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let response_text = match &sealed_jwe {
+        Some(jwe) => {
+            dpop
+                .post_protected_raw(
+                    &http,
+                    &metadata.credential_endpoint,
+                    &access_token,
+                    jwe.clone(),
+                    "application/jwe",
+                )
+                .await
+        }
+        None => {
+            dpop
+                .post_protected_text(
+                    &http,
+                    &metadata.credential_endpoint,
+                    &access_token,
+                    &body_value,
+                )
+                .await
+        }
+    }
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     let response_value = if response_text.trim_start().starts_with('{') {
         serde_json::from_str::<serde_json::Value>(&response_text)
             .map_err(|e| (StatusCode::BAD_GATEWAY, format!("credential response parse: {e}")))?
