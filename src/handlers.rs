@@ -510,8 +510,12 @@ pub async fn issuance_intake(
     let req_body = wallet8::oid4vci::CredentialRequestBody {
         target,
         proofs: serde_json::json!({ "jwt": [proof] }),
+        // The schema forbids extra members: {jwk, enc} only - the
+        // algorithm is identified by the JWK's own 'alg' member.
         credential_response_encryption: response_encryption.as_ref().map(|(m, alg, enc)| {
-            serde_json::json!({ "jwk": m.jwk, "alg": alg, "enc": enc })
+            let mut jwk = m.jwk.clone();
+            jwk["alg"] = serde_json::json!(alg);
+            serde_json::json!({ "jwk": jwk, "enc": enc })
         }),
     };
     let response = wallet8::oid4vci::request_credential(
@@ -1446,13 +1450,14 @@ pub async fn issuance_complete(
         credential_response_encryption: None,
     };
     if let Some((material, alg, enc)) = &response_encryption {
-        // The jwk carries its OWN 'alg' member (the suite's JWE open
-        // reads jwk.alg - draft 16's request block shape).
+        // The request block's schema (the suite's credential_request-
+        // 1_0.json) forbids extra members: {jwk, enc} only - the
+        // algorithm is identified by the JWK's own 'alg' member (the
+        // draft 16 contract the suite's open reads).
         let mut jwk = material.jwk.clone();
         jwk["alg"] = serde_json::json!(alg);
         request_body.credential_response_encryption = Some(serde_json::json!({
             "jwk": jwk,
-            "alg": alg,
             "enc": enc,
         }));
     }
