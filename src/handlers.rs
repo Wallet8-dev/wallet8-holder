@@ -1224,21 +1224,31 @@ pub async fn issuance_complete(
     if expected_state != req.state {
         return Err((StatusCode::BAD_REQUEST, "the state does not match the pushed authorization request (5.2)".into()));
     }
-    // The RFC 9207 §3.1 iss check: when the callback carried an iss,
-    // it MUST equal the AS identifier - a mismatch aborts BEFORE the
-    // token call (the discovery/iss-mismatch postures expect exactly
-    // this refusal).
-    if let Some(cb_iss) = &req.iss {
-        let expected_iss = parked
-            .get("as_identifier")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        if !expected_iss.is_empty() {
-            let norm = |u: &str| u.trim_end_matches('/').to_string();
-            if norm(cb_iss) != norm(expected_iss) {
+    // The RFC 9207 §3.1 iss check: the authorization response MUST
+    // carry iss and it MUST equal the AS identifier - an absent or
+    // mismatched iss aborts BEFORE the token call (the
+    // remove/invalid-iss postures expect exactly this refusal; the
+    // suite's own happy path always sends iss).
+    let expected_iss = parked
+        .get("as_identifier")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !expected_iss.is_empty() {
+        let valid = req.iss.as_deref().map(|cb_iss| {
+            cb_iss.trim_end_matches('/') == expected_iss.trim_end_matches('/')
+        });
+        match valid {
+            Some(true) => {}
+            Some(false) => {
                 return Err((StatusCode::BAD_REQUEST, format!(
-                    "the callback iss {cb_iss} does not match the authorization server {expected_iss} (RFC 9207 §3.1) - refusing the code"
+                    "the callback iss {} does not match the authorization server {expected_iss} (RFC 9207 §3.1) - refusing the code",
+                    req.iss.as_deref().unwrap_or("")
                 )));
+            }
+            None => {
+                return Err((StatusCode::BAD_REQUEST,
+                    "the authorization response carries no iss - RFC 9207 §3.1 requires it - refusing the code".into(),
+                ));
             }
         }
     }
