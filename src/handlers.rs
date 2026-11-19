@@ -1458,7 +1458,7 @@ pub async fn issuance_complete(
                     &metadata.credential_endpoint,
                     &access_token,
                     jwe.clone(),
-                    "application/jwe",
+                    "application/jwt",
                 )
                 .await
         }
