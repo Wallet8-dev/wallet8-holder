@@ -984,6 +984,11 @@ pub struct CompleteRequest {
     /// The authorization response's state (MUST match the pushed
     /// state - §5.2's CSRF defense).
     pub state: String,
+    /// The authorization response's `iss` (RFC 9207 §3.1): when
+    /// present, it MUST equal the AS identifier the code was issued
+    /// by; a mismatch aborts before the token call.
+    #[serde(default)]
+    pub iss: Option<String>,
 }
 
 /// `POST /v1/issuance/prepare` - the authorization-code round's first
@@ -1218,6 +1223,24 @@ pub async fn issuance_complete(
     let expected_state = parked.get("oauth_state").and_then(|v| v.as_str()).unwrap_or("");
     if expected_state != req.state {
         return Err((StatusCode::BAD_REQUEST, "the state does not match the pushed authorization request (5.2)".into()));
+    }
+    // The RFC 9207 §3.1 iss check: when the callback carried an iss,
+    // it MUST equal the AS identifier - a mismatch aborts BEFORE the
+    // token call (the discovery/iss-mismatch postures expect exactly
+    // this refusal).
+    if let Some(cb_iss) = &req.iss {
+        let expected_iss = parked
+            .get("as_identifier")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !expected_iss.is_empty() {
+            let norm = |u: &str| u.trim_end_matches('/').to_string();
+            if norm(cb_iss) != norm(expected_iss) {
+                return Err((StatusCode::BAD_REQUEST, format!(
+                    "the callback iss {cb_iss} does not match the authorization server {expected_iss} (RFC 9207 §3.1) - refusing the code"
+                )));
+            }
+        }
     }
     let user_id = Uuid::parse_str(parked.get("user_id").and_then(|v| v.as_str()).unwrap_or_default())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the session user: {e}")))?;
