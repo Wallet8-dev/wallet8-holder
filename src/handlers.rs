@@ -505,7 +505,7 @@ pub async fn issuance_intake(
         // §9: the deferred form parks the transaction - the app
         // polls /v1/issuance/deferred after `interval`.
         wallet8::oid4vci::CredentialResponse::Deferred { transaction_id, interval, notification_id } => {
-            let deferred_session = format!("vci:deferred:{transaction_id}");
+            let deferred_session = format!("holder:vci:deferred:{transaction_id}");
             {
                 use glide::AsyncCommands as _;
                 let conn = sentin8::middleware::valkey_client(&state.valkey_url, "wallet8:holder")
@@ -522,9 +522,13 @@ pub async fn issuance_intake(
                     "vct": configuration.get("vct").and_then(|v| v.as_str()),
                     "access_token": access_token,
                 });
-                let _: Result<(), _> = conn
-                    .set_ex(&deferred_session, parked.to_string(), 86400u64)
+                let set_result: Result<String, glide::GlideError> = conn
+                    .set_ex(deferred_session.clone(), parked.to_string(), 86400u64)
                     .await;
+                if let Err(e) = set_result {
+                    tracing::error!(error = %e, key = %deferred_session,
+                        "the deferred park write FAILED - the deferred poll will 404");
+                }
             }
             return Ok(Json(serde_json::json!({
                 "status": "deferred",
@@ -1053,6 +1057,15 @@ pub async fn issuance_prepare(
     // The client attestation (the HAIP client_attestation client-auth):
     // the pair rides the PAR push headers when the holder carries the
     // attester identity (DESIGN 4b; the campaign's HAIP variant).
+    // The AS may advertise a challenge_endpoint (HAIP): a fresh
+    // challenge is fetched per endpoint and echoed in the PoP claim.
+    let challenge = match as_metadata.challenge_endpoint.as_deref() {
+        Some(ce) => match wallet8::oid4vci::fetch_attestation_challenge(&http, ce).await {
+            Ok(c) => Some(c),
+            Err(e) => return Err((StatusCode::BAD_GATEWAY, format!("haip challenge: {e}"))),
+        },
+        None => None,
+    };
     let wallet_attestation = state
         .wallet_attestation_slot
         .read()
@@ -1069,7 +1082,10 @@ pub async fn issuance_prepare(
                 // validates against the exact issuer string, trailing
                 // slash included - HAIP-4.4.1).
                 &as_identifier,
-                None,
+                // The HAIP challenge: when the AS advertises a
+                // challenge_endpoint, GET a fresh challenge and echo
+                // it in the PoP 'challenge' claim.
+                challenge.as_deref(),
                 600,
             )
         })
@@ -1211,19 +1227,32 @@ pub async fn issuance_complete(
     // present) rides each attempt as the two OAuth-Client-Attestation
     // headers (fresh PoP jti per attempt too).
     let attester_state = state.wallet_attestation_slot.read().await.clone();
+    // The HAIP token-path challenge: a fresh challenge per exchange when
+    // the AS advertises a challenge_endpoint (the suite validates the
+    // PoP 'challenge' claim against the issued value at token time too).
+    let token_challenge = match as_metadata.challenge_endpoint.as_deref() {
+        Some(ce) => Some(
+            wallet8::oid4vci::fetch_attestation_challenge(&http, ce)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("haip challenge: {e}")))?,
+        ),
+        None => None,
+    };
     let attestation_minter: Option<Box<dyn Fn() -> Result<wallet8::oid4vci::ClientAttestation, String> + Send + Sync>> =
         match attester_state {
             Some((attester, chain, issuer)) => {
                 let as_id = as_identifier.clone();
                 let client_id = state.wallet_client_id.clone();
                 let dk = device_key.clone();
+                let ch = token_challenge.clone();
                 Some(Box::new(move || {
                     wallet8::oid4vci::mint_client_attestation(
                         // The PoP aud = the AS identifier itself (the
                         // exact issuer string, trailing slash included
                         // - the suite validates against the AS issuer,
                         // HAIP-4.4.1).
-                        &attester, &chain, &issuer, &client_id, &dk, &as_id, None, 600,
+                        &attester, &chain, &issuer, &client_id, &dk, &as_id,
+                        ch.as_deref(), 600,
                     )
                 }))
             }
@@ -1345,7 +1374,7 @@ pub async fn issuance_complete(
             (minted, notification_id)
         }
         wallet8::oid4vci::CredentialResponse::Deferred { transaction_id, interval, notification_id } => {
-            let deferred_session = format!("vci:deferred:{transaction_id}");
+            let deferred_session = format!("holder:vci:deferred:{transaction_id}");
             let deferred_parked = serde_json::json!({
                 "credential_issuer": credential_issuer,
                 "credential_endpoint": metadata.credential_endpoint,
@@ -1357,9 +1386,13 @@ pub async fn issuance_complete(
                 "vct": configuration.get("vct").and_then(|v| v.as_str()),
                 "access_token": access_token,
             });
-            let _: Result<(), _> = conn
-                .set_ex(&deferred_session, deferred_parked.to_string(), 86400u64)
+            let set_result: Result<String, glide::GlideError> = conn
+                .set_ex(deferred_session.clone(), deferred_parked.to_string(), 86400u64)
                 .await;
+            if let Err(e) = set_result {
+                tracing::error!(error = %e, key = %deferred_session,
+                    "the deferred park write FAILED - the deferred poll will 404");
+            }
             return Ok(Json(serde_json::json!({
                 "status": "deferred",
                 "transaction_id": transaction_id,
@@ -1584,7 +1617,7 @@ pub async fn issuance_deferred(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let parked_raw: Option<String> = conn
-        .get(format!("vci:deferred:{}", req.transaction_id))
+        .get(format!("holder:vci:deferred:{}", req.transaction_id))
         .await
         .ok()
         .flatten();
@@ -1690,7 +1723,7 @@ pub async fn issuance_deferred(
             }
             // The transaction is consumed (9.1: the issuer
             // invalidates it).
-            let _: Result<(), _> = conn.del(format!("vci:deferred:{}", req.transaction_id)).await;
+            let _: Result<(), _> = conn.del(format!("holder:vci:deferred:{}", req.transaction_id)).await;
             Ok(Json(serde_json::json!({
                 "status": "issued",
                 "id": row_id,
