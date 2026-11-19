@@ -1413,8 +1413,12 @@ pub async fn issuance_complete(
         credential_response_encryption: None,
     };
     if let Some((material, alg, enc)) = &response_encryption {
+        // The jwk carries its OWN 'alg' member (the suite's JWE open
+        // reads jwk.alg - draft 16's request block shape).
+        let mut jwk = material.jwk.clone();
+        jwk["alg"] = serde_json::json!(alg);
         request_body.credential_response_encryption = Some(serde_json::json!({
-            "jwk": material.jwk,
+            "jwk": jwk,
             "alg": alg,
             "enc": enc,
         }));
