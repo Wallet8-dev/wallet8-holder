@@ -477,15 +477,48 @@ pub async fn issuance_intake(
     // round (the token response's authorization_details ride that
     // exchange, 6.2).
     let target = wallet8::oid4vci::CredentialRequestTarget::ConfigurationId(config_id.clone());
+    // The response-encryption material (8.2) - mint when the
+    // configuration advertises alg/enc; the JWE answer is opened with
+    // the ephemeral key.
+    let enc_block = configuration
+        .get("credential_response_encryption");
+    let alg_ok = enc_block
+        .and_then(|e| e.get("alg_values_supported"))
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().any(|v| v.as_str() == Some("ECDH-ES")))
+        .unwrap_or(false);
+    let enc_pick: Option<(&'static str, &'static str)> = if alg_ok {
+        Some((
+            "ECDH-ES",
+            enc_block
+                .and_then(|e| e.get("enc_values_supported"))
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    ["A256GCM", "A128GCM", "A256CBC-HS512", "A128CBC-HS256"]
+                        .iter()
+                        .find(|c| arr.iter().any(|v| v.as_str() == Some(**c)))
+                        .copied()
+                })
+                .unwrap_or("A256GCM"),
+        ))
+    } else {
+        None
+    };
+    let response_encryption =
+        enc_pick.map(|(alg, enc)| (wallet8::oid4vci::mint_response_encryption(), alg, enc));
+    let req_body = wallet8::oid4vci::CredentialRequestBody {
+        target,
+        proofs: serde_json::json!({ "jwt": [proof] }),
+        credential_response_encryption: response_encryption.as_ref().map(|(m, alg, enc)| {
+            serde_json::json!({ "jwk": m.jwk, "alg": alg, "enc": enc })
+        }),
+    };
     let response = wallet8::oid4vci::request_credential(
         &http,
         &metadata.credential_endpoint,
         &access_token,
-        &wallet8::oid4vci::CredentialRequestBody {
-            target,
-            proofs: serde_json::json!({ "jwt": [proof] }),
-            credential_response_encryption: None,
-        },
+        &req_body,
+        response_encryption.as_ref().map(|(m, _, _)| m),
     )
     .await
     .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
@@ -1342,13 +1375,53 @@ pub async fn issuance_complete(
     } else {
         serde_json::json!({ "jwt": [proof] })
     };
-    let request_body = wallet8::oid4vci::CredentialRequestBody {
+    // The response-encryption material (8.2): mint an ephemeral key +
+    // advertise it when the CONFIGURATION advertises alg/enc - the
+    // issuer answers with a JWE the wallet opens.
+    let advertised_config = metadata
+        .credential_configurations_supported
+        .get(&config_id)
+        .cloned()
+        .unwrap_or_default();
+    let enc_block = advertised_config.get("credential_response_encryption");
+    let alg_ok = enc_block
+        .and_then(|e| e.get("alg_values_supported"))
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().any(|v| v.as_str() == Some("ECDH-ES")))
+        .unwrap_or(false);
+    let enc_pick: Option<(&'static str, &'static str)> = if alg_ok {
+        Some((
+            "ECDH-ES",
+            enc_block
+                .and_then(|e| e.get("enc_values_supported"))
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    ["A256GCM", "A128GCM", "A256CBC-HS512", "A128CBC-HS256"]
+                        .iter()
+                        .find(|c| arr.iter().any(|v| v.as_str() == Some(**c)))
+                        .copied()
+                })
+                .unwrap_or("A256GCM"),
+        ))
+    } else {
+        None
+    };
+    let response_encryption =
+        enc_pick.map(|(alg, enc)| (wallet8::oid4vci::mint_response_encryption(), alg, enc));
+    let mut request_body = wallet8::oid4vci::CredentialRequestBody {
         target,
         proofs,
         credential_response_encryption: None,
     };
-    let response_value = dpop
-        .post_protected_json(
+    if let Some((material, alg, enc)) = &response_encryption {
+        request_body.credential_response_encryption = Some(serde_json::json!({
+            "jwk": material.jwk,
+            "alg": alg,
+            "enc": enc,
+        }));
+    }
+    let response_text = dpop
+        .post_protected_text(
             &http,
             &metadata.credential_endpoint,
             &access_token,
@@ -1357,6 +1430,22 @@ pub async fn issuance_complete(
         )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let response_value = if response_text.trim_start().starts_with('{') {
+        serde_json::from_str::<serde_json::Value>(&response_text)
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("credential response parse: {e}")))?
+    } else if response_text.split('.').count() == 5 {
+        let material = response_encryption
+            .as_ref()
+            .map(|(m, _, _)| m)
+            .ok_or((StatusCode::BAD_GATEWAY, "the JWE response arrived without encryption material".to_string()))?;
+        serde_json::to_value(
+            wallet8::oid4vci::decrypt_ecdh_es_a256gcm(response_text.trim(), &material.sk)
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        return Err((StatusCode::BAD_GATEWAY, format!("the credential response is neither JSON nor a JWE ({} chars)", response_text.len())));
+    };
     let response = wallet8::oid4vci::parse_credential_response(&response_value)
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     // (4) The store (8.3) + the notification (11).
