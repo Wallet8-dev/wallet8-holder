@@ -514,6 +514,7 @@ pub async fn issuance_intake(
                 let parked = serde_json::json!({
                     "credential_issuer": offer.credential_issuer,
                     "credential_endpoint": metadata.credential_endpoint,
+                    "deferred_credential_endpoint": metadata.deferred_credential_endpoint,
                     "notification_endpoint": metadata.notification_endpoint,
                     "notification_id": notification_id,
                     "config_id": config_id,
@@ -1378,6 +1379,7 @@ pub async fn issuance_complete(
             let deferred_parked = serde_json::json!({
                 "credential_issuer": credential_issuer,
                 "credential_endpoint": metadata.credential_endpoint,
+                "deferred_credential_endpoint": metadata.deferred_credential_endpoint,
                 "notification_endpoint": metadata.notification_endpoint,
                 "notification_id": notification_id,
                 "config_id": config_id,
@@ -1626,17 +1628,18 @@ pub async fn issuance_deferred(
     let parked: serde_json::Value = serde_json::from_str(&parked_raw)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the parked parse: {e}")))?;
     let http = state.http_client();
-    // The AS's deferred endpoint (9.1) - re-resolved from the issuer
-    // metadata (§9.1's deferred_credential_endpoint member); the
-    // parked rows carry the issuer identifier + the access token.
+    // The AS's deferred endpoint (9.1) - the PARKED row carries the
+    // already-resolved deferred_credential_endpoint (re-resolving the
+    // issuer metadata here would form the WRONG .well-known path for
+    // the suite's path-bearing issuer identifier - RFC8414 §1 puts the
+    // path COMPONENT AFTER the well-known prefix).
+    let deferred_endpoint = parked
+        .get("deferred_credential_endpoint")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or((StatusCode::NOT_IMPLEMENTED, "the parked row carries no deferred endpoint".into()))?
+        .to_string();
     let issuer = parked.get("credential_issuer").and_then(|v| v.as_str()).unwrap_or_default();
-    let metadata = wallet8::oid4vci::resolve_issuer_metadata(&http, issuer)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-    let deferred_endpoint = metadata
-        .deferred_credential_endpoint
-        .as_deref()
-        .ok_or((StatusCode::NOT_IMPLEMENTED, "the issuer advertises no deferred endpoint (9.1)".into()))?;
     let access_token = parked
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -1649,7 +1652,7 @@ pub async fn issuance_deferred(
     let mut dpop = wallet8::oid4vci::DpopSession::new(device_key);
     let poll_body = serde_json::json!({ "transaction_id": req.transaction_id });
     let answer_value = dpop
-        .post_protected_json(&http, deferred_endpoint, &access_token, &poll_body)
+        .post_protected_json(&http, &deferred_endpoint, &access_token, &poll_body)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
     let answer = parse_deferred_answer(&answer_value)
