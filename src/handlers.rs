@@ -1419,13 +1419,40 @@ pub async fn issuance_complete(
             "enc": enc,
         }));
     }
+    // The credential REQUEST encryption (8.2 encrypted variant): when
+    // the issuer advertises credential_request_encryption with a key,
+    // the body rides as a compact JWE (ECDH-ES + A256GCM) to that key.
+    let body_value = serde_json::to_value(&request_body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let req_jwk = metadata
+        .credential_request_encryption
+        .as_ref()
+        .and_then(|r| r.get("jwks"))
+        .and_then(|j| j.get("keys"))
+        .and_then(|k| k.as_array())
+        .and_then(|arr| arr.first())
+        .cloned();
+    let req_body_value = match (&req_jwk, &response_encryption) {
+        // Seal only when the issuer's key is an EC P-256 key (the
+        // ECDH-ES family the wallet implements).
+        (Some(jwk), Some(_)) if jwk.get("kty").and_then(|v| v.as_str()) == Some("EC") => {
+            let kid = jwk.get("kid").and_then(|v| v.as_str());
+            let jwe = wallet8::oid4vci::encrypt_request_ecdh_es_a256gcm(
+                &body_value,
+                jwk,
+                kid,
+            )
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the request seal: {e}")))?;
+            serde_json::Value::String(jwe)
+        }
+        _ => body_value,
+    };
     let response_text = dpop
         .post_protected_text(
             &http,
             &metadata.credential_endpoint,
             &access_token,
-            &serde_json::to_value(&request_body)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            &req_body_value,
         )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
