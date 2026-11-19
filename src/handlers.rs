@@ -1662,6 +1662,13 @@ pub async fn issuance_deferred(
             serde_json::json!({"status": "pending", "transaction_id": transaction_id, "interval": interval}),
         )),
         wallet8::oid4vci::DeferredAnswer::Issued(creds) => {
+            // The §9.2 200 carries the OPTIONAL notification_id (the
+            // deferred-notification variant: the notification rides the
+            // ISSUE, not the original credential response).
+            let notification_id = answer_value
+                .get("notification_id")
+                .and_then(|n| n.as_str())
+                .map(str::to_string);
             let minted = creds
                 .first()
                 .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (9.2)".into()))?
@@ -1712,12 +1719,18 @@ pub async fn issuance_deferred(
             // The terminal notification (11) when the deferred flow
             // carried one - through the same DPoP session (DESIGN 4b:
             // the resource endpoint's own nonce challenge applies).
-            if let (Some(endpoint), Some(notification_id)) = (
+            // The id rides the PARKED row when the original credential
+            // response carried it, else the POLL's 200 (the deferred-
+            // notification variant).
+            let notification_id = notification_id.or_else(|| {
+                parked.get("notification_id").and_then(|n| n.as_str()).map(str::to_string)
+            });
+            if let (Some(endpoint), Some(nid)) = (
                 parked.get("notification_endpoint").and_then(|v| v.as_str()),
-                parked.get("notification_id").and_then(|v| v.as_str()),
+                notification_id.as_deref(),
             ) {
                 let notify_body = serde_json::json!({
-                    "notification_id": notification_id,
+                    "notification_id": nid,
                     "event": wallet8::oid4vci::NotificationEvent::CredentialAccepted.code(),
                 });
                 let _ = dpop
