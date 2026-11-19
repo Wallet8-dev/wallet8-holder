@@ -480,8 +480,9 @@ pub async fn issuance_intake(
     // The response-encryption material (8.2) - mint when the
     // configuration advertises alg/enc; the JWE answer is opened with
     // the ephemeral key.
-    let enc_block = configuration
-        .get("credential_response_encryption");
+    // The encryption block rides the METADATA TOP LEVEL (draft 16
+    // moved credential_response_encryption out of the configuration).
+    let enc_block = metadata.credential_response_encryption.as_ref();
     let alg_ok = enc_block
         .and_then(|e| e.get("alg_values_supported"))
         .and_then(|a| a.as_array())
@@ -1376,36 +1377,34 @@ pub async fn issuance_complete(
         serde_json::json!({ "jwt": [proof] })
     };
     // The response-encryption material (8.2): mint an ephemeral key +
-    // advertise it when the CONFIGURATION advertises alg/enc - the
-    // issuer answers with a JWE the wallet opens.
-    let advertised_config = metadata
-        .credential_configurations_supported
-        .get(&config_id)
-        .cloned()
-        .unwrap_or_default();
-    let enc_block = advertised_config.get("credential_response_encryption");
-    let alg_ok = enc_block
-        .and_then(|e| e.get("alg_values_supported"))
-        .and_then(|a| a.as_array())
-        .map(|a| a.iter().any(|v| v.as_str() == Some("ECDH-ES")))
-        .unwrap_or(false);
-    let enc_pick: Option<(&'static str, &'static str)> = if alg_ok {
-        Some((
-            "ECDH-ES",
-            enc_block
-                .and_then(|e| e.get("enc_values_supported"))
-                .and_then(|v| v.as_array())
-                .and_then(|arr| {
-                    ["A256GCM", "A128GCM", "A256CBC-HS512", "A128CBC-HS256"]
-                        .iter()
-                        .find(|c| arr.iter().any(|v| v.as_str() == Some(**c)))
-                        .copied()
-                })
-                .unwrap_or("A256GCM"),
-        ))
-    } else {
-        None
-    };
+    // advertise it when the issuer advertises alg/enc - the issuer
+    // answers with a JWE the wallet opens. The block rides the METADATA
+    // TOP LEVEL (draft 16 moved it out of the configuration).
+    let enc_pick: Option<(&'static str, &'static str)> =
+        metadata
+            .credential_response_encryption
+            .as_ref()
+            .and_then(|block| {
+                let alg_ok = block
+                    .get("alg_values_supported")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.iter().any(|v| v.as_str() == Some("ECDH-ES")))
+                    .unwrap_or(false);
+                if !alg_ok {
+                    return None;
+                }
+                let enc = ["A256GCM", "A128GCM", "A256CBC-HS512", "A128CBC-HS256"]
+                    .iter()
+                    .find(|c| {
+                        block
+                            .get("enc_values_supported")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().any(|v| v.as_str() == Some(**c)))
+                            .unwrap_or(false)
+                    })
+                    .copied();
+                enc.map(|e| ("ECDH-ES", e))
+            });
     let response_encryption =
         enc_pick.map(|(alg, enc)| (wallet8::oid4vci::mint_response_encryption(), alg, enc));
     let mut request_body = wallet8::oid4vci::CredentialRequestBody {
