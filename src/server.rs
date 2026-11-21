@@ -200,7 +200,10 @@ pub fn sd_jwt_claims(
     let mut map = std::collections::BTreeMap::new();
     let text = String::from_utf8_lossy(material).to_string();
     // The compact form: header.payload~disclosures~ - the payload is
-    // the second segment.
+    // the second segment. The credential's claims live in the
+    // DISCLOSURES (each `[salt, name, value]` reveals an object
+    // member): the top-level _sd markers carry only digests, so the
+    // DCQL claim matching reads the decoded member values.
     if let Some(part) = text.split('.').nth(1) {
         use base64::Engine;
         if let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part) {
@@ -215,6 +218,80 @@ pub fn sd_jwt_claims(
                 }
             }
         }
+    }
+    // The SELECTIVE-DISCLOSURE TREE: every 3-part disclosure carries
+    // [salt, name, value]; a value's nested `_sd` digests resolve
+    // against the sibling disclosures. The flattened map keeps the
+    // DCQL paths ('place_of_birth/country') AND the plain names.
+    let digests: std::collections::HashMap<String, (String, serde_json::Value)> = {
+        use base64::Engine;
+        let mut m = std::collections::HashMap::new();
+        for part in text.split('~').skip(1) {
+            if part.is_empty() {
+                continue;
+            }
+            if let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(part) {
+                if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&raw) {
+                    if arr.len() == 3 {
+                        use sha2::Digest as _;
+                    let name = arr[1].as_str().map(str::to_owned);
+                    let digest: String = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(sha2::Sha256::digest(part.as_bytes()));
+                    if let Some(name) = name {
+                        m.insert(digest, (name, arr[2].clone()));
+                    }
+                    }
+                }
+            }
+        }
+        m
+    };
+    // Walk each top-level disclosure: the value's nested _sd digests
+    // resolve to child claims (recursively) whose paths prefix with
+    // the parent's name.
+    fn walk_value(
+        map: &mut std::collections::BTreeMap<String, serde_json::Value>,
+        digests: &std::collections::HashMap<String, (String, serde_json::Value)>,
+        prefix: Option<&str>,
+        value: &serde_json::Value,
+    ) {
+        if let Some(obj) = value.as_object() {
+            if let Some(sds) = obj.get("_sd").and_then(|v| v.as_array()) {
+                for dg in sds {
+                    if let Some(dg) = dg.as_str() {
+                        if let Some((name, child)) = digests.get(dg) {
+                            let path = match prefix {
+                                Some(p) => format!("{p}/{name}"),
+                                None => name.clone(),
+                            };
+                            map.insert(path.clone(), child.clone());
+                            walk_value(map, digests, Some(&path), child);
+                        }
+                    }
+                }
+            }
+            for (k, v) in obj {
+                if k.starts_with('_') {
+                    continue;
+                }
+                let path = match prefix {
+                    Some(p) => format!("{p}/{k}"),
+                    None => k.clone(),
+                };
+                walk_value(map, digests, Some(&path), v);
+            }
+        } else if let Some(arr) = value.as_array() {
+            for v in arr {
+                walk_value(map, digests, prefix, v);
+            }
+        }
+    }
+    for (name, value) in digests.values() {
+        // Every named disclosure starts one path: the value's OWN
+        // nested digests walk with the name as the prefix (the child
+        // paths 'parent/child' - the DCQL path-key form).
+        map.insert(name.clone(), value.clone());
+        walk_value(&mut map, &digests, Some(name), value);
     }
     (map, text)
 }

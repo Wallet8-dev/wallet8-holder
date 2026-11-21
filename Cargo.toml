@@ -59,3 +59,8 @@ wallet8 = { path = "../wallet8-sdk/facade" }
 wallet8-oid4vci-client = { path = "../wallet8-sdk/crates/oid4vci-client" }
 wallet8-oid4vp-client = { path = "../wallet8-sdk/crates/oid4vp-client" }
 wallet8-holder-contracts = { path = "../wallet8-sdk/crates/holder-contracts" }
+
+# The local platform SDK too: the mdoc engine rides the same dev-tree
+# override (the mso/parse fixes land here before the next sdk tag).
+[patch."https://github.com/Sentin8/sentin8-sdk"]
+sentin8 = { path = "/home/hamid/dev/sentin8.new/sentin8/sentin8-sdk/facade" }

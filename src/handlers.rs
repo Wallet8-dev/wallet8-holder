@@ -371,14 +371,14 @@ pub async fn issuance_intake(
     let config_id = offer
         .credential_configuration_ids
         .first()
-        .ok_or((StatusCode::BAD_REQUEST, "the offer lists no configurations (4.1.1)".into()))?
+        .ok_or((StatusCode::BAD_REQUEST, "the offer lists no configurations".into()))?
         .clone();
     let configuration = metadata
         .credential_configurations_supported
         .get(&config_id)
         .ok_or((
             StatusCode::BAD_REQUEST,
-            "the offered configuration is unknown to the issuer (4.1.1)".into(),
+            "the offered configuration is unknown to the issuer".into(),
         ))?;
     // (3) The pre-authorized grant (3.5 + 6.1): the anonymous form
     //     drops the client_id when the AS advertises
@@ -448,7 +448,7 @@ pub async fn issuance_intake(
         token
             .get("access_token")
             .and_then(|t| t.as_str())
-            .ok_or((StatusCode::BAD_GATEWAY, "the token response carries no access_token (6.2)".into()))?
+            .ok_or((StatusCode::BAD_GATEWAY, "the token response carries no access_token".into()))?
             .to_string()
     };
     // (4) The nonce pre-flight (7.1: a nonce_endpoint present makes
@@ -536,7 +536,7 @@ pub async fn issuance_intake(
         wallet8::oid4vci::CredentialResponse::Issued { credentials, notification_id } => {
             let minted = credentials
                 .first()
-                .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (8.3)".into()))?
+                .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted".into()))?
                 .clone();
             (minted, notification_id)
         }
@@ -652,12 +652,28 @@ pub async fn issuance_intake(
 /// The presentation-resolve request (the app's consent preview).
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ResolveRequest {
-    /// The scanned verifier request_uri.
+    /// The scanned verifier request_uri. OPTIONAL: the DC API channel's
+    /// inline request (App. A) carries no request_uri at all.
+    #[serde(default)]
     pub request_uri: String,
     /// The platform-asserted origin (the DC API channel - App. A.2);
     /// None on the redirect channels.
     #[serde(default)]
     pub origin: Option<String>,
+    /// The INLINE request form (the DC API channel - App. A): the
+    /// request object (or its JWT) rides the call, not a request_uri.
+    #[serde(default)]
+    pub request: Option<serde_json::Value>,
+    /// The redirect URL's `request_uri_method` (5.10): `post` switches
+    /// the request-object fetch to the form POST carrying the wallet's
+    /// metadata + a fresh nonce (the verifier re-signs with both).
+    #[serde(default)]
+    pub request_uri_method: Option<String>,
+    /// The caller's knowledge that the inline body is a PLAIN request
+    /// object (the unsigned dc_api channel) - not a JWS. The resolve
+    /// also sniffs the body (a '{' first char) as the fallback.
+    #[serde(default)]
+    pub inline_object: bool,
 }
 
 /// `POST /v1/presentation/resolve` - the pre-consent preview: parse
@@ -686,24 +702,83 @@ pub async fn presentation_resolve(
     // The request-object fetch (5.4 option 3 / RFC 9101: the
     // request_uri serves the request object).
     let http = state.http_client();
-    let object = http
-        .get(&req.request_uri)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("request object fetch: {e}")))?
-        .text()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("request object read: {e}")))?;
+    // The request-object source: the DC-API channel carries the
+    // object INLINE (App. A); the redirect channels fetch the
+    // request_uri (5.4 option 3 / RFC 9101).
+    let object: String = if let Some(inline) = &req.request {
+        if let Some(jwt) = inline.as_str() {
+            jwt.to_string()
+        } else {
+            serde_json::to_string(inline)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("the inline request serialize: {e}")))?
+        }
+    } else if req.request_uri_method.as_deref() == Some("post") {
+        // 5.10: the form POST carries the wallet's client_metadata +
+        // a fresh nonce (the verifier folds both into the re-signed
+        // request object). The wallet metadata: the formats the
+        // presenter supports (the vp_formats the holder can deliver).
+        let wallet_metadata = serde_json::json!({
+            "vp_formats_supported": {
+                "dc+sd-jwt": {
+                    "sd-jwt_alg_values": ["ES256"],
+                    "kb-jwt_alg_values": ["ES256"]
+                },
+                "mso_mdoc": {
+                    "proof_signing_alg_values_supported": ["ES256"]
+                }
+            }
+        });
+        wallet8::oid4vp::fetch_request_uri_post(&http, &req.request_uri, &wallet_metadata)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?
+    } else {
+        http.get(&req.request_uri)
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("request object fetch: {e}")))?
+            .text()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("request object read: {e}")))?
+    };
     // §5.9 + §15.8: the signature + the per-prefix rules verify
     // FIRST - fail-closed, the visible error the app renders.
-    let request = wallet8::oid4vp::verify_request_object(&object, &state.verifier_trust)
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{}: {}", e.code, e.description)))?;
+    // The inline form may be a PLAIN request object (the unsigned
+    // dc_api channel - App. A) rather than the signed JWS: dispatch on
+    // the first non-whitespace character ('{' = the object form).
+    let looks_plain = req.inline_object
+        || object.trim_start().starts_with('{');
+    let request = if looks_plain {
+        let v: serde_json::Value = serde_json::from_str(&object)
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("the request object parse: {e}")))?;
+        // The DC API channel (App. A): the signed/unsigned distinction
+        // decides the tolerance. The UNSIGNED plain object treats the
+        // browser origin as the trust context - the embedded
+        // client_id/expected_origins are INFORMATIONAL (must be
+        // ignored, App. A.2 - the alternate-flow row drives exactly
+        // this). A SIGNED form (the multisigned JWS JSON
+        // serialization: payload + signatures) carries a verified
+        // verifier identity - the expected_origins claim MUST be
+        // enforced against the platform origin there (the negative
+        // wrong-origins row drives the rejection; the alternate
+        // summary says the tolerance is "no-op for signed requests").
+        let signed_form = v.get("payload").is_some() && v.get("signatures").is_some();
+        let v = wallet8::oid4vp::verify_request_object_value(&v, req.origin.as_deref())
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{}: {}", e.code, e.description)))?;
+        if signed_form {
+            wallet8::oid4vp::check_expected_origins(&v, req.origin.as_deref())
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
+        v
+    } else {
+        let request = wallet8::oid4vp::verify_request_object(&object, &state.verifier_trust)
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("{}: {}", e.code, e.description)))?;
+        wallet8::oid4vp::check_expected_origins(&request, req.origin.as_deref())
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        request
+    };
     // The shape gate (§5.1/5.2 - includes the transaction_data
     // rejection §8.4).
     wallet8::oid4vp::check_request_shape(&request)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    // The DC API origin check (App. A.2).
-    wallet8::oid4vp::check_expected_origins(&request, req.origin.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // The scope alias resolution (§5.5) - a scope request maps to
     // the DCQL query the registry defines.
@@ -712,7 +787,7 @@ pub async fn presentation_resolve(
     let query = request
         .dcql_query
         .as_ref()
-        .ok_or((StatusCode::BAD_REQUEST, "the request carries no dcql_query (5.1)".into()))?;
+        .ok_or((StatusCode::BAD_REQUEST, "the request carries no dcql_query".into()))?;
     // The vault snapshot (the user's holdings) - the sealed rows open
     // for the DCQL evaluation (6.4).
     let holdings = state.user_holdings(&user_id).await?;
@@ -828,7 +903,7 @@ pub async fn presentation_deliver(
     if !req.approved {
         return Ok(Json(wallet8::oid4vp::error_response(
             wallet8::oid4vp::WalletError::AccessDenied,
-            "the user declined to share the requested credentials (8.5)",
+            "the user declined to share the requested credentials",
             request.state.as_deref(),
         )));
     }
@@ -836,19 +911,75 @@ pub async fn presentation_deliver(
     // truth; the shape + origin checks run again).
     wallet8::oid4vp::check_request_shape(&request)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    wallet8::oid4vp::check_expected_origins(&request, req.origin.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // The DC API response_mode skips the origin comparison (the
+    // browser context is the same-origin authority; the embedded
+    // expected_origins are informational - App. A).
+    let origin_check = if request.response_mode.as_deref().map(|m| m.starts_with("dc_api")).unwrap_or(false) {
+        true
+    } else {
+        wallet8::oid4vp::check_expected_origins(&request, req.origin.as_deref()).is_ok()
+    };
+    if !origin_check {
+        return Err((StatusCode::BAD_REQUEST,
+            "the platform origin matches no expected_origins entry".into()));
+    }
     let request = wallet8::oid4vp::resolve_scope_alias(&request, &state.scope_registry)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let dcql = request
         .dcql_query
         .as_ref()
-        .ok_or((StatusCode::BAD_REQUEST, "the request carries no dcql_query (5.1)".into()))?;
+        .ok_or((StatusCode::BAD_REQUEST, "the request carries no dcql_query".into()))?;
     // The holdings + the 6.4 evaluation + the 8.1 assembly (the mdoc
     // DeviceResponse over the B.2.6 transcripts; the sd-jwt + KB).
     let holdings = state.user_holdings(&user_id).await?;
     let matches = wallet8::oid4vp::evaluate_dcql(dcql, &holdings)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    // The 6.4.1 claim availability gate: the assembled vp_token must
+    // contain EVERY selected claim path. A path that exists NOWHERE in
+    // the holding makes the required Credential Query UNSATISFIABLE -
+    // the §8.5 authorization error (no vp_token) is the ONLY correct
+    // response (the response-side rule the negative battery checks).
+    {
+        let missing = wallet8::oid4vp::find_unsatisfied_claim_paths(&matches);
+        if !missing.is_empty() {
+            // The error channel follows the response_mode (8.5): a
+            // dc_api request has NO back-channel endpoint by design -
+            // the wallet returns the authorization error through the
+            // API's own channel (the promise result; the intake
+            // surfaces the refusal screen). A redirect-channel request
+            // (direct_post / direct_post.jwt) posts the 8.5 error to
+            // the response_uri (missing only there is a defect).
+            let mode = request.response_mode.as_deref().unwrap_or("direct_post");
+            if mode.starts_with("dc_api") {
+                return Ok(Json(serde_json::json!({
+                    "status": "refused",
+                    "error": "access_denied",
+                    "reason": "the wallet cannot satisfy the requested credential claims",
+                    "unsatisfied": missing,
+                })));
+            }
+            let response_uri = request
+                .response_uri
+                .as_deref()
+                .or(request.redirect_uri.as_deref())
+                .map(str::to_owned)
+                .ok_or((StatusCode::BAD_REQUEST, "the request carries no response_uri".into()))?;
+            let http = state.http_client();
+            let _delivered = wallet8::oid4vp::post_response_error(
+                &http,
+                &response_uri,
+                "access_denied",
+                "the wallet cannot satisfy the requested credential claims",
+                request.state.as_deref(),
+            )
+            .await;
+            return Ok(Json(serde_json::json!({
+                "status": "error_delivered",
+                "error": "access_denied",
+                "unsatisfied": missing,
+            })));
+        }
+    }
     let device_key = state.device_key(&user_id).await?;
     let vp_token = wallet8::oid4vp::build_vp_token(&matches, &device_key, &request, req.origin.as_deref())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -875,7 +1006,7 @@ pub async fn presentation_deliver(
         "direct_post.jwt" => {
             let response_uri = request.response_uri.clone().ok_or((
                 StatusCode::BAD_REQUEST,
-                "the request carries no response_uri (8.2)".into(),
+                "the request carries no response_uri".into(),
             ))?;
             let http = state.http_client();
             let result = wallet8::oid4vp::post_response_encrypted(
@@ -894,7 +1025,7 @@ pub async fn presentation_deliver(
             let response_uri = request
                 .response_uri
                 .clone()
-                .ok_or((StatusCode::BAD_REQUEST, "the request carries no response_uri (8.2)".into()))?;
+                .ok_or((StatusCode::BAD_REQUEST, "the request carries no response_uri".into()))?;
             let http = state.http_client();
             let result = wallet8::oid4vp::post_response(
                 &http,
@@ -1042,7 +1173,7 @@ pub async fn issuance_prepare(
     let config_id = offer
         .credential_configuration_ids
         .first()
-        .ok_or((StatusCode::BAD_REQUEST, "the offer lists no configurations (4.1.1)".into()))?
+        .ok_or((StatusCode::BAD_REQUEST, "the offer lists no configurations".into()))?
         .clone();
     // The authorization-server selection: the authorization_code
     // grant's hint or the metadata's list (12.2.4).
@@ -1062,7 +1193,7 @@ pub async fn issuance_prepare(
     let par_endpoint = as_metadata
         .pushed_authorization_request_endpoint
         .clone()
-        .ok_or((StatusCode::NOT_IMPLEMENTED, "the AS advertises no PAR endpoint (5.1.4/9126)".into()))?;
+        .ok_or((StatusCode::NOT_IMPLEMENTED, "the AS advertises no PAR endpoint".into()))?;
     // (3) The PAR push (5.1.4) - the authorization_details form
     // (5.1.1) with the locations member when the metadata lists
     // multiple authorization_servers.
@@ -1226,7 +1357,7 @@ pub async fn issuance_complete(
     // match the callback's).
     let expected_state = parked.get("oauth_state").and_then(|v| v.as_str()).unwrap_or("");
     if expected_state != req.state {
-        return Err((StatusCode::BAD_REQUEST, "the state does not match the pushed authorization request (5.2)".into()));
+        return Err((StatusCode::BAD_REQUEST, "the state does not match the pushed authorization request".into()));
     }
     // The RFC 9207 §3.1 iss check: the authorization response MUST
     // carry iss and it MUST equal the AS identifier - an absent or
@@ -1245,7 +1376,7 @@ pub async fn issuance_complete(
             Some(true) => {}
             Some(false) => {
                 return Err((StatusCode::BAD_REQUEST, format!(
-                    "the callback iss {} does not match the authorization server {expected_iss} (RFC 9207 §3.1) - refusing the code",
+                    "the callback iss {} does not match the authorization server {expected_iss} - refusing the code",
                     req.iss.as_deref().unwrap_or("")
                 )));
             }
@@ -1346,14 +1477,14 @@ pub async fn issuance_complete(
     let access_token = token_response
         .get("access_token")
         .and_then(|t| t.as_str())
-        .ok_or((StatusCode::BAD_GATEWAY, "the token response carries no access_token (6.2)".into()))?
+        .ok_or((StatusCode::BAD_GATEWAY, "the token response carries no access_token".into()))?
         .to_string();
     // (2) The target: the credential_identifiers when the token
     // response carried authorization_details (6.2), else the
     // configuration id (8.2).
     let target = match wallet8::oid4vci::credential_identifiers(&token_response) {
         Some(ids) => wallet8::oid4vci::CredentialRequestTarget::Identifier(
-            ids.first().cloned().ok_or((StatusCode::BAD_GATEWAY, "no credential_identifiers (6.2)".into()))?,
+            ids.first().cloned().ok_or((StatusCode::BAD_GATEWAY, "no credential_identifiers".into()))?,
         ),
         None => wallet8::oid4vci::CredentialRequestTarget::ConfigurationId(config_id.clone()),
     };
@@ -1544,7 +1675,7 @@ pub async fn issuance_complete(
         wallet8::oid4vci::CredentialResponse::Issued { credentials, notification_id } => {
             let minted = credentials
                 .first()
-                .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (8.3)".into()))?
+                .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted".into()))?
                 .credential
                 .clone();
             (minted, notification_id)
@@ -1769,7 +1900,7 @@ fn parse_deferred_answer(
             interval,
         });
     }
-    Err("the deferred response carries neither credentials nor transaction_id (§9.2)".into())
+    Err("the deferred response carries neither credentials nor transaction_id".into())
 }
 
 /// `POST /v1/issuance/deferred` - the §9 poll: the parked
@@ -1846,7 +1977,7 @@ pub async fn issuance_deferred(
                 .map(str::to_string);
             let minted = creds
                 .first()
-                .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted (9.2)".into()))?
+                .ok_or((StatusCode::BAD_GATEWAY, "no credentials minted".into()))?
                 .credential
                 .clone();
             let format = parked.get("format").and_then(|v| v.as_str()).unwrap_or("mso_mdoc").to_string();
