@@ -11,6 +11,22 @@
   ],
   "extra_env": {
     "WALLET8_HOLDER_CLIENT_ID": "wallet8-holder",
-    "WALLET8_HOLDER_REDIRECT_URI": "https://localhost.emobix.co.uk:8443/test/a/sentin8-wallet/callback"
-  }
+    "WALLET8_HOLDER_REDIRECT_URI": "",
+    "WALLET8_HOLDER_SUITE_ALIAS": "sentin8-wallet"
+  },
+  "apps": [
+    {
+      "slug": "wallet8-holder",
+      "web_dir": "../wallet8-wallet/build/web",
+      "listing": {
+        "app_name": "Wallet8:Holder",
+        "app_slug": "wallet8-holder",
+        "description": "The Wallet8 holder - issuance intake, vault, and presentation surfaces.",
+        "backend_url": "https://wallet8-holder.ops.sys.oidf.sentin8.dev",
+        "supports_dcr": false,
+        "visibility": "public",
+        "status": "published"
+      }
+    }
+  ]
 }

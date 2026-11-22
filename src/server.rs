@@ -189,6 +189,35 @@ pub fn mdoc_claims(material: &[u8]) -> (std::collections::BTreeMap<String, serde
     (map, String::from_utf8_lossy(material).to_string())
 }
 
+/// Flatten one claim member into the DCQL path-key form.
+///
+/// An OBJECT claim (`place_of_birth: {locality, country}`) is
+/// individually addressable by a DCQL `claims.path` of
+/// `["place_of_birth","locality"]` - the §6.4.1 claim-set preference
+/// resolves against exactly that key. Inserting only the parent left
+/// every nested `claim_sets` option unsatisfiable, so the holder fell
+/// through to a less preferred option (the suite's
+/// `oid4vp-1final-wallet-pid-claims-path-object-member` WARNING).
+/// Arrays keep their parent key only: a DCQL path descends OBJECT
+/// members, never array indices.
+fn flatten_member(
+    map: &mut std::collections::BTreeMap<String, serde_json::Value>,
+    prefix: &str,
+    value: &serde_json::Value,
+) {
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+    for (k, v) in obj {
+        if k.starts_with('_') {
+            continue; // the selective-disclosure markers
+        }
+        let path = format!("{prefix}/{k}");
+        map.insert(path.clone(), v.clone());
+        flatten_member(map, &path, v);
+    }
+}
+
 /// The SD-JWT's payload claims (the 7.1 claims path keys are the
 /// top-level member names) + the compact credential form.
 ///
@@ -214,6 +243,18 @@ pub fn sd_jwt_claims(
                             continue; // the selective-disclosure markers
                         }
                         map.insert(k.clone(), val.clone());
+                        // NESTED members flatten into the DCQL path-key
+                        // form (`place_of_birth/locality`): an OBJECT
+                        // claim's members are individually addressable
+                        // by a `claims.path` query, and §6.4.1's
+                        // claim_sets preference resolves against THESE
+                        // keys - inserting only the parent left every
+                        // nested option unsatisfiable and the holder
+                        // fell through to a less preferred option (the
+                        // suite's
+                        // `oid4vp-1final-wallet-pid-claims-path-object-member`
+                        // WARNING).
+                        flatten_member(&mut map, k, val);
                     }
                 }
             }
@@ -292,6 +333,12 @@ pub fn sd_jwt_claims(
         // paths 'parent/child' - the DCQL path-key form).
         map.insert(name.clone(), value.clone());
         walk_value(&mut map, &digests, Some(name), value);
+        // A disclosed OBJECT value's members are individually
+        // addressable (`place_of_birth/locality`): the §6.4.1
+        // claim_sets preference resolves against exactly that key, so
+        // the members flatten here too (the same rule the payload
+        // loop applies).
+        flatten_member(&mut map, name, value);
     }
     (map, text)
 }
@@ -367,8 +414,30 @@ pub async fn build_state(
         .expect("the derived dev key is a valid master key");
     let wallet_client_id = std::env::var("WALLET8_HOLDER_CLIENT_ID")
         .unwrap_or_else(|_| "wallet8-web".to_string());
+    // The PAR redirect_uri (DESIGN 4b): an explicit
+    // WALLET8_HOLDER_REDIRECT_URI wins; otherwise the rig-domain mode's
+    // suite base derives it - CONFORMANCE_SUITE_URL, then
+    // CONFORMANCE_SUITE_TARGET=hosted (certification.openid.net), then
+    // the local rig's nginx alias (all with the VCI wallet alias). The
+    // value MUST match the client row the cert-wallet env registered
+    // (the seed writes the suite-target switch's callback there); a
+    // mismatch is the suite's "redirect_uri does not match the
+    // registered redirect_uri" 400 at the PAR push.
+    let wallet_alias = std::env::var("WALLET8_HOLDER_SUITE_ALIAS")
+        .unwrap_or_else(|_| "sentin8-wallet".to_string());
+    let suite_base_env = std::env::var("CONFORMANCE_SUITE_URL").ok().filter(|u|
+        !u.trim().is_empty());
+    let suite_base = suite_base_env.unwrap_or_else(|| {
+        if std::env::var("CONFORMANCE_SUITE_TARGET").as_deref() == Ok("hosted") {
+            "https://www.certification.openid.net".to_string()
+        } else {
+            "https://localhost.emobix.co.uk:8443".to_string()
+        }
+    });
     let wallet_redirect_uri = std::env::var("WALLET8_HOLDER_REDIRECT_URI")
-        .unwrap_or_else(|_| "https://wallet8.local/cb".to_string());
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| format!("{}/test/a/{wallet_alias}/callback", suite_base.trim_end_matches('/')));
     // The client-attestation identity (HAIP client_attestation): the
     // ATTESTER trust-domain key + x5c chain (+ the issuer id the
     // attestation claims). WALLET8_HOLDER_ATTESTATION_KEY_PEM +
