@@ -1107,6 +1107,15 @@ pub struct PrepareRequest {
     /// The AS-metadata URL override (the same campaign rule - RFC 8414).
     #[serde(default)]
     pub as_metadata_url: Option<String>,
+    /// The client's registered redirect URI for THIS interaction
+    /// (DESIGN "the redirect_uri is per-session, resolved at prepare").
+    /// The AS registered it for the client, so it belongs to the
+    /// interaction rather than the deployment: PAR and the token
+    /// exchange MUST name the same value, so it is parked with the
+    /// session and reused by `complete`. Absent = the deployment's
+    /// configured `WALLET8_HOLDER_REDIRECT_URI`.
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
 }
 
 /// The complete request (the browser callback -> the credential).
@@ -1203,6 +1212,18 @@ pub async fn issuance_prepare(
         None
     };
     let details = wallet8::oid4vci::authorization_details(&config_id, locations, None);
+    // The redirect URI for THIS interaction: the request's own value
+    // when supplied (the conformance campaign registers a callback on
+    // the suite it is driving), else the deployment's configured one.
+    // Parked with the session so the token exchange names the same URI
+    // (RFC 6749 4.1.3 - a paraphrase here would be rejected by the AS).
+    let redirect_uri = req
+        .redirect_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or(state.wallet_redirect_uri.as_str())
+        .to_string();
     let issuer_state = offer.grants.iter().find_map(|g| match g {
         wallet8::oid4vci::OfferGrant::AuthorizationCode { issuer_state, .. } => {
             issuer_state.clone()
@@ -1270,7 +1291,7 @@ pub async fn issuance_prepare(
         &http,
         &par_endpoint,
         &state.wallet_client_id,
-        &state.wallet_redirect_uri,
+        &redirect_uri,
         &details,
         issuer_state.as_deref(),
         Some(&client_assertion),
@@ -1299,6 +1320,9 @@ pub async fn issuance_prepare(
             "metadata": metadata,
             "pkce_verifier": pkce.verifier,
             "oauth_state": oauth_state,
+            // The interaction's redirect URI (the complete leg names
+            // the same value - RFC 6749 4.1.3).
+            "redirect_uri": redirect_uri,
         });
         let _: Result<(), _> = conn
             .set_ex(&session, parked.to_string(), 600u64)
@@ -1415,6 +1439,15 @@ pub async fn issuance_complete(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // The redirect URI the prepare leg used (parked with the session:
+    // the token exchange MUST name the same value as the PAR - RFC 6749
+    // 4.1.3). A session parked before this field existed falls back to
+    // the deployment's configured value.
+    let redirect_uri = parked
+        .get("redirect_uri")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| state.wallet_redirect_uri.clone());
     let http = state.http_client();
     // (1) The token exchange (6.1: the code + PKCE + the redirect +
     // the private_key_jwt client assertion) bound with the DPoP
@@ -1466,7 +1499,7 @@ pub async fn issuance_complete(
             &http,
             &as_metadata.token_endpoint,
             &state.wallet_client_id,
-            &state.wallet_redirect_uri,
+            &redirect_uri,
             &req.code,
             &pkce_verifier,
             Some(as_identifier.as_str()),
