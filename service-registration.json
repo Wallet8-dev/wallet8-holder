@@ -6,7 +6,8 @@
       "telemetry_property": {
         "slug": "holder",
         "name": "Wallet8:Holder Telemetry"
-      }
+      },
+      "exposure": "internal"
     }
   ],
   "extra_env": {
